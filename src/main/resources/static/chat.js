@@ -17,7 +17,7 @@ function connect(){
   const ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws/chat');socket=ws;
   ws.onopen=()=>{if(version!==generation)return;ws.send(JSON.stringify({type:'join',roomId:room,clientId,name}))};
   ws.onmessage=e=>{if(version!==generation)return;const event=JSON.parse(e.data);
-    if(event.type==='joined'){joined=true;attempt=0;for(const m of event.messages)messages.set(m.id,m);status('● 연결됨 · '+room);render();flush()}
+    if(event.type==='joined'){joined=true;attempt=0;for(const m of event.messages)messages.set(m.id,m);status('● 연결됨 · '+room);$('notice').textContent='연결되었습니다. 최근 대화를 불러왔습니다.';render();flush()}
     else if(event.type==='message'){messages.set(event.message.id,event.message);pending=pending.filter(p=>p.requestId!==event.message.requestId||event.message.clientId!==clientId);store();render()}
     else if(event.type==='ack'){messages.set(event.message.id,event.message);pending=pending.filter(p=>p.requestId!==event.requestId);store();render();$('notice').textContent=event.duplicate?'중복 요청 · 기존 메시지로 확인했습니다.':'서버 저장 확인 · #'+event.message.id}
     else if(event.type==='presence')$('presence').textContent=event.names.join(', ')||'—';
