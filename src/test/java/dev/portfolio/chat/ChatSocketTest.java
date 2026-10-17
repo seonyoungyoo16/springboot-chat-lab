@@ -25,7 +25,7 @@ class ChatSocketTest {
         JsonNode await(String type) throws Exception { long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);while(System.nanoTime()<until){var e=events.poll(100,TimeUnit.MILLISECONDS);if(e!=null&&e.path("type").asText().equals(type))return e;}throw new AssertionError("No event: "+type); }
         JsonNode join(String room, String client) throws Exception { send(Map.of("type","join","roomId",room,"clientId",client,"name",client));return await("joined"); }
         boolean getsMessage() throws Exception { long until=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(300);while(System.nanoTime()<until){var e=events.poll(30,TimeUnit.MILLISECONDS);if(e!=null&&e.path("type").asText().equals("message"))return true;}return false; }
-        @Override public void close() { socket.sendClose(WebSocket.NORMAL_CLOSURE,"test complete").join(); }
+        @Override public void close() { if (!socket.isOutputClosed()) socket.sendClose(WebSocket.NORMAL_CLOSURE,"test complete").join(); }
     }
     @Test void twoClientsRoomIsolationDuplicateAndReconnect() throws Exception {
         String client="a"+System.nanoTime(), request=UUID.randomUUID().toString();long id;
@@ -85,6 +85,23 @@ class ChatSocketTest {
             var reads=reconnect.join("lobby",sender).path("reads");
             JsonNode stored=null;for(var receipt:reads)if(receipt.path("clientId").asText().equals(reader))stored=receipt;
             assertThat(stored).isNotNull();assertThat(stored.path("lastReadId").asLong()).isEqualTo(lastId);
+        }
+    }
+    @Test void typingIsTransientScopedToRoomAndExcludesSender() throws Exception {
+        long before=repository.count();
+        try(var a=new Peer();var b=new Peer();var other=new Peer()){
+            a.send(Map.of("type","typing","active",true));a.await("error");
+            String sender="t"+System.nanoTime();a.join("lobby",sender);b.join("lobby","u"+System.nanoTime());other.join("design","v"+System.nanoTime());
+            a.send(Map.of("type","typing","active","yes"));a.await("error");
+            a.send(Map.of("type","typing","active",true,"clientId","forged","roomId","design"));
+            var typing=b.await("typing");assertThat(typing.path("clientId").asText()).isEqualTo(sender);assertThat(typing.path("roomId").asText()).isEqualTo("lobby");assertThat(typing.path("active").asBoolean()).isTrue();assertThat(typing.path("expiresInMs").asInt()).isEqualTo(4000);
+            assertThat(a.events.stream().noneMatch(e->e.path("type").asText().equals("typing"))).isTrue();
+            assertThat(other.events.stream().noneMatch(e->e.path("type").asText().equals("typing"))).isTrue();
+            a.send(Map.of("type","typing","active",false));assertThat(b.await("typing").path("active").asBoolean()).isFalse();
+            a.send(Map.of("type","typing","active",true));b.await("typing");
+            a.socket.sendClose(WebSocket.NORMAL_CLOSURE,"typing complete").join();
+            assertThat(b.await("typing").path("active").asBoolean()).isFalse();
+            assertThat(repository.count()).isEqualTo(before);
         }
     }
 }

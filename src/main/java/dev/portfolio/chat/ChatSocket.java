@@ -23,6 +23,7 @@ public class ChatSocket extends TextWebSocketHandler {
                 case "join" -> join(socket, input);
                 case "send" -> send(socket, input);
                 case "read" -> read(socket, input);
+                case "typing" -> typing(socket, input);
                 default -> throw new IllegalArgumentException("지원하지 않는 메시지 유형입니다.");
             }
         } catch (com.fasterxml.jackson.core.JsonProcessingException | IllegalArgumentException error) {
@@ -53,6 +54,20 @@ public class ChatSocket extends TextWebSocketHandler {
         var receipt = service.markRead(member.roomId(), member.clientId(), input.path("upToId").asLong());
         broadcast(member.roomId(), Map.of("type", "read", "receipt", receipt));
     }
+    private void typing(WebSocketSession socket, JsonNode input) {
+        var member = members.get(socket.getId());
+        if (member == null) throw new IllegalArgumentException("먼저 채팅방에 입장해 주세요.");
+        if (!input.path("active").isBoolean()) throw new IllegalArgumentException("입력 상태는 boolean이어야 합니다.");
+        relayTyping(member, input.path("active").asBoolean());
+    }
+    private void relayTyping(Member source, boolean active) {
+        // Transient presence: no message save, history entry, read cursor, or ACK.
+        var event = Map.of("type", "typing", "roomId", source.roomId(), "clientId", source.clientId(), "name", source.name(), "active", active, "expiresInMs", 4000);
+        for (var peer : List.copyOf(members.values())) {
+            if (!peer.roomId().equals(source.roomId()) || peer.clientId().equals(source.clientId())) continue;
+            try { emit(peer.socket(), event); } catch (IOException | IllegalStateException error) { try { peer.socket().close(CloseStatus.SERVER_ERROR); } catch (IOException ignored) {} }
+        }
+    }
     private void emit(WebSocketSession socket, Object event) throws IOException {
         if (!socket.isOpen()) return;
         try { socket.sendMessage(new TextMessage(json.writeValueAsString(event))); }
@@ -69,6 +84,6 @@ public class ChatSocket extends TextWebSocketHandler {
         broadcast(roomId, Map.of("type", "presence", "roomId", roomId, "names", names));
     }
     @Override public synchronized void afterConnectionClosed(WebSocketSession socket, CloseStatus status) {
-        var member = members.remove(socket.getId()); if (member != null) presence(member.roomId());
+        var member = members.remove(socket.getId()); if (member != null) { relayTyping(member, false); presence(member.roomId()); }
     }
 }

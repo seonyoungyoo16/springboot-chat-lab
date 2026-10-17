@@ -3,3 +3,5 @@
 .read-state{display:block;text-align:right;font-size:11px;color:#ffc391;margin-top:8px}
 
 .conversation-closed{min-height:380px;padding:36px 20px;text-align:center;align-content:center}.conversation-closed>span{color:#ffbd8f;font-size:14px}.room-head{flex-wrap:wrap}[hidden]{display:none!important}
+
+.typing-status{min-height:22px;margin:4px 0;font-size:13px;color:#9edabb}
