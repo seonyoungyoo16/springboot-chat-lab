@@ -9,3 +9,10 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   CONSTRAINT uq_chat_request UNIQUE(client_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_chat_room_id ON chat_messages(room_id, id);
+CREATE TABLE IF NOT EXISTS chat_reads (
+  room_id VARCHAR(30) NOT NULL,
+  client_id VARCHAR(80) NOT NULL,
+  last_read_id BIGINT NOT NULL,
+  PRIMARY KEY(room_id, client_id),
+  FOREIGN KEY(last_read_id) REFERENCES chat_messages(id)
+);

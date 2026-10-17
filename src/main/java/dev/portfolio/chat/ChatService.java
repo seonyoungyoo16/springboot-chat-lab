@@ -3,10 +3,28 @@ import java.time.Instant;
 import java.util.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.jdbc.core.JdbcTemplate;
 @Service
 public class ChatService {
     private final MessageRepository messages;
-    ChatService(MessageRepository messages) { this.messages = messages; }
+    private final JdbcTemplate jdbc;
+    ChatService(MessageRepository messages, JdbcTemplate jdbc) { this.messages = messages; this.jdbc = jdbc; }
+    public record ReadView(String roomId, String clientId, long lastReadId) {}
+    @Transactional(readOnly = true)
+    public List<ReadView> reads(String roomId) {
+        validateRoom(roomId);
+        return jdbc.query("SELECT client_id, last_read_id FROM chat_reads WHERE room_id = ?", (row, index) -> new ReadView(roomId, row.getString(1), row.getLong(2)), roomId);
+    }
+    @Transactional
+    public ReadView markRead(String roomId, String clientId, long upToId) {
+        validateRoom(roomId); identifier(clientId);
+        messages.findById(upToId).filter(message -> message.roomId.equals(roomId)).orElseThrow(() -> new IllegalArgumentException("현재 방의 저장된 메시지만 읽음 처리할 수 있습니다."));
+        // ChatSocket serializes commands in this single-process demo; cursors never decrease.
+        int updated = jdbc.update("UPDATE chat_reads SET last_read_id = GREATEST(last_read_id, ?) WHERE room_id = ? AND client_id = ?", upToId, roomId, clientId);
+        if (updated == 0) jdbc.update("INSERT INTO chat_reads(room_id, client_id, last_read_id) VALUES (?, ?, ?)", roomId, clientId, upToId);
+        long saved = jdbc.queryForObject("SELECT last_read_id FROM chat_reads WHERE room_id = ? AND client_id = ?", Long.class, roomId, clientId);
+        return new ReadView(roomId, clientId, saved);
+    }
     public record MessageView(Long id, String roomId, String clientId, String requestId, String sender, String body, Instant createdAt) {}
     public record Saved(MessageView message, boolean duplicate) {}
     public void validateRoom(String roomId) {

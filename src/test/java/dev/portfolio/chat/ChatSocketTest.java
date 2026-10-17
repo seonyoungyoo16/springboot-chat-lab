@@ -59,4 +59,32 @@ class ChatSocketTest {
         assertThat(rooms.statusCode()).isEqualTo(200);assertThat(json.readTree(rooms.body()).size()).isEqualTo(2);
         var invalid=http.send(HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/rooms/missing/messages")).build(),HttpResponse.BodyHandlers.ofString());assertThat(invalid.statusCode()).isEqualTo(400);
     }
+    @Test void readReceiptsRequireExplicitReadAndSurviveReconnect() throws Exception {
+        String sender="s"+System.nanoTime(),reader="r"+System.nanoTime();long lastId;
+        try(var a=new Peer();var b=new Peer();var other=new Peer()){
+            b.send(Map.of("type","read","upToId",1));b.await("error");
+            a.join("lobby",sender);other.join("design","o"+System.nanoTime());
+            a.send(Map.of("type","send","requestId",UUID.randomUUID().toString(),"body","아직 읽지 않은 첫 메시지"));
+            long firstId=a.await("message").path("message").path("id").asLong();a.await("ack");
+            a.send(Map.of("type","send","requestId",UUID.randomUUID().toString(),"body","오프라인 중 두 번째 메시지"));
+            lastId=a.await("message").path("message").path("id").asLong();a.await("ack");
+            var joined=b.join("lobby",reader);
+            assertThat(joined.path("reads").findValuesAsText("clientId")).doesNotContain(reader);
+            long count=repository.count();
+            // Identity comes from the joined session, never from a supplied clientId.
+            b.send(Map.of("type","read","upToId",lastId,"clientId",sender));
+            var receipt=a.await("read").path("receipt");assertThat(receipt.path("clientId").asText()).isEqualTo(reader);assertThat(receipt.path("lastReadId").asLong()).isEqualTo(lastId);
+            b.await("read");b.send(Map.of("type","read","upToId",firstId));
+            assertThat(a.await("read").path("receipt").path("lastReadId").asLong()).isEqualTo(lastId);b.await("read");
+            other.send(Map.of("type","send","requestId",UUID.randomUUID().toString(),"body","다른 방"));long foreignId=other.await("message").path("message").path("id").asLong();other.await("ack");
+            for(Object invalid:List.of(Long.MAX_VALUE,-1L,foreignId,1.5)){b.send(Map.of("type","read","upToId",invalid));b.await("error");}
+            assertThat(repository.count()).isEqualTo(count+1);
+            assertThat(other.events.stream().noneMatch(e->e.path("type").asText().equals("read"))).isTrue();
+        }
+        try(var reconnect=new Peer()){
+            var reads=reconnect.join("lobby",sender).path("reads");
+            JsonNode stored=null;for(var receipt:reads)if(receipt.path("clientId").asText().equals(reader))stored=receipt;
+            assertThat(stored).isNotNull();assertThat(stored.path("lastReadId").asLong()).isEqualTo(lastId);
+        }
+    }
 }

@@ -22,6 +22,7 @@ public class ChatSocket extends TextWebSocketHandler {
             switch (input.path("type").asText()) {
                 case "join" -> join(socket, input);
                 case "send" -> send(socket, input);
+                case "read" -> read(socket, input);
                 default -> throw new IllegalArgumentException("지원하지 않는 메시지 유형입니다.");
             }
         } catch (com.fasterxml.jackson.core.JsonProcessingException | IllegalArgumentException error) {
@@ -34,7 +35,7 @@ public class ChatSocket extends TextWebSocketHandler {
         String name = service.text(input.path("name").asText(), 20, "이름"); service.validateRoom(roomId);
         var history = service.history(roomId);
         members.put(socket.getId(), new Member(socket, roomId, clientId, name));
-        emit(socket, Map.of("type", "joined", "roomId", roomId, "clientId", clientId, "messages", history));
+        emit(socket, Map.of("type", "joined", "roomId", roomId, "clientId", clientId, "messages", history, "reads", service.reads(roomId)));
         presence(roomId);
     }
     private void send(WebSocketSession socket, JsonNode input) throws IOException {
@@ -45,6 +46,13 @@ public class ChatSocket extends TextWebSocketHandler {
         if (!saved.duplicate()) broadcast(member.roomId(), Map.of("type", "message", "message", saved.message()));
         emit(socket, Map.of("type", "ack", "requestId", requestId, "message", saved.message(), "duplicate", saved.duplicate()));
     }
+    private void read(WebSocketSession socket, JsonNode input) {
+        var member = members.get(socket.getId());
+        if (member == null) throw new IllegalArgumentException("먼저 채팅방에 입장해 주세요.");
+        if (!input.path("upToId").isIntegralNumber() || !input.path("upToId").canConvertToLong()) throw new IllegalArgumentException("메시지 ID가 필요합니다.");
+        var receipt = service.markRead(member.roomId(), member.clientId(), input.path("upToId").asLong());
+        broadcast(member.roomId(), Map.of("type", "read", "receipt", receipt));
+    }
     private void emit(WebSocketSession socket, Object event) throws IOException {
         if (!socket.isOpen()) return;
         try { socket.sendMessage(new TextMessage(json.writeValueAsString(event))); }
@@ -53,7 +61,7 @@ public class ChatSocket extends TextWebSocketHandler {
     private void broadcast(String roomId, Object event) {
         for (var member : List.copyOf(members.values())) {
             if (!member.roomId().equals(roomId)) continue;
-            try { emit(member.socket(), event); } catch (IOException error) { try { member.socket().close(CloseStatus.SERVER_ERROR); } catch (IOException ignored) {} }
+            try { emit(member.socket(), event); } catch (IOException | IllegalStateException error) { try { member.socket().close(CloseStatus.SERVER_ERROR); } catch (IOException ignored) {} }
         }
     }
     private void presence(String roomId) {
