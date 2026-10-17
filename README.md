@@ -28,7 +28,7 @@ WebSocket endpoint: `/ws/chat` (같은 origin의 브라우저 연결).
 {"type":"send","requestId":"message-uuid","body":"안녕하세요"}
 ```
 
-서버 이벤트: `joined` (messages 배열), `presence` (names 배열), `message` (저장된 message 객체), `ack` (requestId/message/duplicate), `error` (code/detail).
+서버 이벤트: `joined` (messages 배열과 reads 배열), `presence` (names 배열), `message` (저장된 message 객체), `ack` (requestId/message/duplicate), `read` (receipt: roomId/clientId/lastReadId), `error` (code/detail).
 메시지 객체: `id, roomId, clientId, requestId, sender, body, createdAt`.
 
 REST: `GET /api/rooms`, `GET /api/rooms/{roomId}/messages` (최근 100개).

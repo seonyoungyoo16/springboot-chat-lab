@@ -15,6 +15,7 @@ function bubble(m,waiting){const div=document.createElement('article');div.class
 function markVisibleRead(){
   if(document.hidden||!joined||socket?.readyState!==WebSocket.OPEN)return;
   const area=$('messages');if(area.scrollHeight-area.scrollTop-area.clientHeight>24)return;
+  const end=area.lastElementChild?.getBoundingClientRect();if(!end||end.bottom<=0||end.bottom>innerHeight+2)return;
   const latest=Math.max(0,...[...messages.values()].filter(m=>m.clientId!==clientId&&m.roomId===room).map(m=>m.id));
   if(latest<=Math.max(readRequested,reads.get(clientId)?.lastReadId||0))return;
   readRequested=latest;socket.send(JSON.stringify({type:'read',upToId:latest}));
@@ -43,3 +44,4 @@ $('body').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preve
 window.addEventListener('pagehide',()=>{clearTimeout(retry);socket?.close()});status('연결 전');render();
 
 $('messages').addEventListener('scroll',markVisibleRead);document.addEventListener('visibilitychange',markVisibleRead);window.addEventListener('focus',markVisibleRead);
+window.addEventListener('scroll',markVisibleRead,{passive:true});new IntersectionObserver(markVisibleRead,{threshold:[0,.1,1]}).observe($('messages'));
