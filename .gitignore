@@ -1,0 +1,6 @@
+target/
+data/
+.mvn-runtime/
+*.log
+.env
+.idea/

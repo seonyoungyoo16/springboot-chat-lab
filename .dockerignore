@@ -1,0 +1,6 @@
+.git
+target
+data
+.mvn-runtime
+node_modules
+*.log
