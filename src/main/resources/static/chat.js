@@ -1,19 +1,20 @@
 const $=id=>document.getElementById(id);
 const clientId=sessionStorage.getItem('chat-client')||crypto.randomUUID();sessionStorage.setItem('chat-client',clientId);
-let socket=null,wanted=false,joined=false,retry=null,attempt=0,generation=0,room='lobby',name='참가자';
+let socket=null,wanted=false,joined=false,retry=null,attempt=0,generation=0,room='lobby',name='참가자',viewOpen=true;
 let messages=new Map(),pending=[],reads=new Map(),readRequested=0;
 try{pending=JSON.parse(sessionStorage.getItem('chat-pending')||'[]')}catch{}
 const store=()=>{try{sessionStorage.setItem('chat-pending',JSON.stringify(pending))}catch{}};
-function status(text){$('status').textContent=text;$('body').disabled=!joined;$('send').disabled=!joined;$('connect').disabled=wanted;$('disconnect').disabled=!wanted;$('name').disabled=wanted}
+function status(text){$('status').textContent=text;$('body').disabled=!joined;$('send').disabled=!joined;$('connect').disabled=wanted;$('disconnect').disabled=!wanted;$('name').disabled=wanted;$('closed-state').textContent=joined?'온라인 · 메시지 수신 중':'오프라인 · 서버에 대화 보관 중'}
 function render(follow=true){
   const top=$('messages').scrollTop,atBottom=$('messages').scrollHeight-top-$('messages').clientHeight<24;
   const rows=[...messages.values()].sort((a,b)=>a.id-b.id).slice(-100);
+  $('closed-count').textContent='받은 메시지 '+rows.length+'건 · 안 읽은 메시지 '+rows.filter(m=>m.clientId!==clientId&&m.id>(reads.get(clientId)?.lastReadId||0)).length+'건';
   const elements=rows.map(m=>bubble(m,false));for(const p of pending.filter(p=>p.roomId===room))elements.push(bubble({clientId,sender:name,body:p.body,requestId:p.requestId},true));
   $('messages').replaceChildren(...elements);$('messages').scrollTop=follow&&atBottom?$('messages').scrollHeight:top;requestAnimationFrame(markVisibleRead);
 }
 function bubble(m,waiting){const div=document.createElement('article');div.className='bubble'+(m.clientId===clientId?' mine':'')+(waiting?' pending':'');const small=document.createElement('small');small.textContent=m.sender+' · '+(waiting?'서버 확인 대기':'#'+m.id+' · '+new Date(m.createdAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}));const p=document.createElement('p');p.textContent=m.body;div.append(small,p);if(!waiting&&m.clientId===clientId){const receipt=document.createElement('span');receipt.className='read-state';receipt.textContent=[...reads.values()].some(r=>r.clientId!==clientId&&r.roomId===room&&r.lastReadId>=m.id)?'읽음':'안 읽음';div.append(receipt)}return div}
 function markVisibleRead(){
-  if(document.hidden||!joined||socket?.readyState!==WebSocket.OPEN)return;
+  if(document.hidden||!viewOpen||!joined||socket?.readyState!==WebSocket.OPEN)return;
   const area=$('messages');if(area.scrollHeight-area.scrollTop-area.clientHeight>24)return;
   const end=area.lastElementChild?.getBoundingClientRect();if(!end||end.bottom<=0||end.bottom>innerHeight+2)return;
   const latest=Math.max(0,...[...messages.values()].filter(m=>m.clientId!==clientId&&m.roomId===room).map(m=>m.id));
@@ -45,3 +46,5 @@ window.addEventListener('pagehide',()=>{clearTimeout(retry);socket?.close()});st
 
 $('messages').addEventListener('scroll',markVisibleRead);document.addEventListener('visibilitychange',markVisibleRead);window.addEventListener('focus',markVisibleRead);
 window.addEventListener('scroll',markVisibleRead,{passive:true});new IntersectionObserver(markVisibleRead,{threshold:[0,.1,1]}).observe($('messages'));
+
+$('view-toggle').onclick=()=>{viewOpen=!viewOpen;$('view-toggle').textContent=viewOpen?'대화창 닫기':'대화창 열기';$('view-toggle').setAttribute('aria-expanded',String(viewOpen));$('conversation-view').hidden=!viewOpen;$('conversation-closed').hidden=viewOpen;if(viewOpen){$('messages').scrollTop=$('messages').scrollHeight;requestAnimationFrame(markVisibleRead)}};
