@@ -1,11 +1,11 @@
-import {ChatSendQueue} from './chat-queue.js';
+import {ChatSendQueue,prepareRequeueBody} from './chat-queue.js';
 const sendQueue=new ChatSendQueue();
 const $=id=>document.getElementById(id);
 const clientId=sessionStorage.getItem('chat-client')||crypto.randomUUID();sessionStorage.setItem('chat-client',clientId);
 let socket=null,wanted=false,joined=false,retry=null,attempt=0,generation=0,room='lobby',name='참가자',viewOpen=true;
 let messages=new Map(),pending=[],reads=new Map(),readRequested=new Map(),cutRequest=null;
 try{pending=JSON.parse(sessionStorage.getItem('chat-pending')||'[]')}catch{}
-let databaseBlocked=false;const cancellations=[];
+let databaseBlocked=false;const cancellations=[],requeueDrafts=new Map();let canceledRenderKey='';
 let typingSent=false,lastTypingAt=0,typingIdle=null;const peerTyping=new Map();
 const store=(items=pending)=>{try{sessionStorage.setItem('chat-pending',JSON.stringify(items));return true}catch{$('notice').textContent='대기 상태를 저장하지 못해 전송·취소를 보류합니다.';return false}};
 function status(text){$('status').textContent=text;$('body').disabled=!joined;$('send').disabled=!joined;$('fault').disabled=!joined;$('connect').disabled=wanted;$('disconnect').disabled=!wanted;$('name').disabled=wanted;$('closed-state').textContent=joined?'온라인 · 메시지 수신 중':'오프라인 · 서버에 대화 보관 중'}
@@ -26,15 +26,35 @@ function render(follow=true){
     row.append(title,body,id,cancel);list.append(row);
   }
   $('outbox').replaceChildren();if(queued.length){const heading=document.createElement('strong');heading.textContent='전송 대기 '+queued.length+'건 · ACK 후 다음 요청';$('outbox').append(heading,list)}
-  const cancelledList=document.createElement('ol');for(const [index,p] of cancellations.filter(p=>p.roomId===room).entries()){
-    const row=document.createElement('li'),body=document.createElement('p'),id=document.createElement('code'),label=document.createElement('small'),resend=document.createElement('button');
-    body.textContent=(p.requeuedAs?'이전 요청 취소됨 · ':'취소됨 · ')+p.body;label.textContent='이전 요청 ID';id.textContent=p.requestId;id.dataset.requestRole='old';row.append(body,label,id);
-    if(p.requeuedAs){const nextLabel=document.createElement('small'),nextId=document.createElement('code');nextLabel.textContent='다시 보낸 새 ID';nextId.textContent=p.requeuedAs;nextId.dataset.requestRole='new';row.append(nextLabel,nextId)}
-    resend.type='button';resend.className='text-action requeue-action';resend.textContent=p.requeuedAs?'대기열에 다시 추가됨':'다시 보내기';resend.disabled=!!p.requeuedAs;resend.setAttribute('aria-label','취소 메시지 '+(index+1)+' 다시 보내기');resend.onclick=()=>requeueCanceled(p.roomId,p.requestId);
-    row.append(resend);cancelledList.append(row);
-  }
-  $('cancelled').replaceChildren();if(cancelledList.children.length){const title=document.createElement('strong');title.textContent='취소한 요청 '+cancelledList.children.length+'건 · 이전 ID 재전송 제외';$('cancelled').append(title,cancelledList)}
+  renderCanceled();
   $('messages').replaceChildren(...elements);$('messages').scrollTop=follow&&atBottom?$('messages').scrollHeight:top;requestAnimationFrame(markVisibleRead);
+}
+function renderCanceled(){
+  const items=cancellations.filter(p=>p.roomId===room),key=JSON.stringify([room,items.map(p=>[p.requestId,p.requeuedAs])]);
+  if(key===canceledRenderKey)return; // Incoming messages/read receipts must not replace an editor in use.
+  canceledRenderKey=key;
+  const list=document.createElement('ol');
+  for(const [index,p] of items.entries()){
+    const row=document.createElement('li'),original=document.createElement('p'),id=document.createElement('code'),label=document.createElement('small'),resend=document.createElement('button');
+    original.textContent='취소됨 · '+p.body;label.textContent='이전 요청 ID';id.textContent=p.requestId;id.dataset.requestRole='old';row.append(original,label,id);
+    resend.className='text-action requeue-action';resend.setAttribute('aria-label','취소 메시지 '+(index+1)+' 다시 보내기');
+    if(p.requeuedAs){
+      const bodyLabel=document.createElement('small'),body=document.createElement('p'),nextLabel=document.createElement('small'),nextId=document.createElement('code');
+      bodyLabel.textContent='다시 보낸 내용';body.className='requeued-body';body.textContent=p.requeuedBody??p.body;
+      nextLabel.textContent='다시 보낸 새 ID';nextId.textContent=p.requeuedAs;nextId.dataset.requestRole='new';
+      resend.type='button';resend.textContent='대기열에 다시 추가됨';resend.disabled=true;row.append(bodyLabel,body,nextLabel,nextId,resend);
+    }else{
+      const form=document.createElement('form'),field=document.createElement('label'),title=document.createElement('span'),input=document.createElement('textarea'),hint=document.createElement('small');
+      form.className='requeue-editor';title.textContent='다시 보낼 내용';input.value=requeueDrafts.get(p.requestId)??p.body;input.maxLength=2000;input.rows=2;
+      input.setAttribute('aria-label','취소 메시지 '+(index+1)+' 다시 보낼 내용');hint.id='requeue-hint-'+p.requestId;input.setAttribute('aria-describedby',hint.id);
+      const update=()=>{const valid=!!input.value.trim()&&input.value.trim().length<=2000;resend.disabled=!valid;input.setAttribute('aria-invalid',String(!valid));hint.textContent=(valid?'수정한 내용은 새 ID로 맨 뒤에 추가합니다.':'메시지는 1~2000자입니다.')+' '+input.value.length.toLocaleString()+' / 2,000자'};
+      input.oninput=()=>{requeueDrafts.set(p.requestId,input.value);update()};
+      resend.type='submit';resend.textContent='다시 보내기';form.onsubmit=event=>{event.preventDefault();if(!resend.disabled)requeueCanceled(p.roomId,p.requestId,input.value)};
+      update();field.append(title,input);form.append(field,hint,resend);row.append(form);
+    }
+    list.append(row);
+  }
+  $('cancelled').replaceChildren();if(items.length){const title=document.createElement('strong');title.textContent='취소한 요청 '+items.length+'건 · 이전 ID 재전송 제외';$('cancelled').append(title,list)}
 }
 function bubble(m,waiting){const div=document.createElement('article');div.className='bubble'+(m.clientId===clientId?' mine':'')+(waiting?' pending':'');const small=document.createElement('small');small.textContent=m.sender+' · '+(waiting?(m.id?'#'+m.id+' · ACK 확인 대기':'서버 확인 대기'):'#'+m.id+' · '+new Date(m.createdAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}));const p=document.createElement('p');p.textContent=m.body;div.append(small,p);if(!waiting&&m.clientId===clientId){const receipt=document.createElement('span');receipt.className='read-state';receipt.textContent=[...reads.values()].some(r=>r.clientId!==clientId&&r.roomId===room&&(r.deliveryMode||'direct')===(m.deliveryMode||'direct')&&r.lastReadId>=m.id)?'읽음':'안 읽음';div.append(receipt)}return div}
 function markVisibleRead(){
@@ -69,13 +89,14 @@ function cancelPending(roomId,requestId){
   cancellations.push(request);if(cancellations.length>20)cancellations.shift();if(cutRequest===requestId)cutRequest=null;
   render(false);$('notice').textContent='전송 대기 취소 · '+requestId+' · 나머지는 원래 순서대로 처리합니다.';flush();
 }
-function requeueCanceled(roomId,canceledId){
+function requeueCanceled(roomId,canceledId,editedBody){
   const canceled=cancellations.find(p=>p.roomId===roomId&&p.requestId===canceledId);if(!canceled||canceled.requeuedAs)return;
   try{
+    const body=prepareRequeueBody(editedBody); // Validate the edited body before allocating a fresh identity.
     const requestId=crypto.randomUUID(); // New identity for a canceled message.
-    const restored=sendQueue.requeue(pending,canceled,requestId);if(!store(restored.pending))return;
+    const restored=sendQueue.requeue(pending,canceled,requestId,body);if(!store(restored.pending))return;
     pending=restored.pending; // Append at tail before dispatch; existing request order is unchanged.
-    canceled.requeuedAs=requestId;render(false);$('notice').textContent='새 요청 ID '+requestId+' · 대기열 맨 뒤에 추가했습니다. 기존 순서는 유지합니다.';flush();
+    canceled.requeuedAs=requestId;canceled.requeuedBody=body;requeueDrafts.delete(canceled.requestId);render(false);$('notice').textContent='새 요청 ID '+requestId+' · 수정한 내용을 대기열 맨 뒤에 추가했습니다. 기존 내용·ID·순서는 유지합니다.';flush();
   }catch(error){$('notice').textContent=error.message}
 }
 function flush(){

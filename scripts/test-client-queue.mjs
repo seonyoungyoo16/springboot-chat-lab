@@ -71,3 +71,21 @@ for(const mode of ['direct','kafka']){
   const second=queue.requeue([],restored.request,mode+'-fresh-6');assert.equal(second.request.requeuedFrom,restored.request.requestId)
 }
 console.log('Requeue canceled: fresh ID, append-only order, original payload/mode, single use, active-send isolation, reload, ID collision guards and repeated cancellation passed.')
+
+for(const mode of ['direct','kafka']){
+  const queue=new ChatSendQueue(),requests=[1,2,3].map(n=>({roomId:'design',requestId:'edit-'+mode+'-'+n,body:'original '+n,mode,cancelable:true}))
+  const canceled=requests[1],pending=queue.cancel(requests,'design',canceled.requestId),active=queue.next(pending,'design'),snapshot=JSON.stringify({pending,canceled})
+  for(const invalid of ['', ' \n\t ', '가'.repeat(2001), null]){
+    assert.throws(()=>queue.requeue(pending,canceled,'edit-'+mode+'-invalid',invalid))
+    assert.equal(JSON.stringify({pending,canceled}),snapshot);assert.equal(queue.inFlight.requestId,active.requestId)
+  }
+  const edited='수정한 메시지\n줄바꿈 유지',restored=queue.requeue(pending,canceled,'edit-'+mode+'-new','  '+edited+'  ')
+  assert.equal(JSON.stringify({pending,canceled}),snapshot);assert.equal(canceled.body,'original 2')
+  assert.deepEqual(restored.pending.slice(0,-1),pending);assert.equal(restored.request.body,edited);assert.equal(restored.request.mode,mode)
+  assert.equal(restored.request.requeuedFrom,canceled.requestId);assert.equal(queue.inFlight.requestId,active.requestId)
+  queue.reset();let reloaded=JSON.parse(JSON.stringify(restored.pending));const sent=[]
+  while(reloaded.length){const request=queue.next(reloaded,'design');sent.push(request);reloaded=queue.acknowledge(reloaded,request)}
+  assert.deepEqual(sent.map(p=>p.requestId),[requests[0].requestId,requests[2].requestId,restored.request.requestId]);assert.deepEqual(sent.map(p=>p.body),['original 1','original 3',edited])
+  assert.equal(queue.requeue([],canceled,'edit-'+mode+'-boundary','가'.repeat(2000)).request.body.length,2000)
+}
+console.log('Edited canceled resend: invalid drafts leave queue/in-flight untouched, multiline body and fresh ID survive reload, and survivors retain their order in both modes.')
