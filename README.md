@@ -102,3 +102,12 @@ Kafka 중단과 전달 서버 중단을 독립적으로 선택합니다. `PUT /a
 - 실제 `KafkaTemplate.send`가 실패해도 Outbox를 발행 완료로 갱신하지 않고 다음 스케줄에 재시도합니다. `publishError`에는 예외 종류만 표시합니다. 테스트는 전송 실패를 주입한 뒤 실제 임베디드 Kafka로 복구 발행하는 경우도 별도로 확인합니다.
 
 체험: Kafka 방식 선택 → Kafka 중단 → 메시지 여러 개 전송 → Outbox 미발행 수 증가/상대 미수신 확인 → Kafka 복구 → 발행 및 전달 확인. 두 역할을 모두 중단했다면 Kafka 복구 후 대기가 Kafka로 옮겨가는 것과 전달 서버 복구 후 수신되는 것을 차례로 확인합니다.
+
+
+### DB 중단과 같은 요청 ID 재시도
+
+데모 제어를 켜면 `PUT /api/demo/delivery`의 `{"databaseRunning":false}`로 DB 접근 실패를 재현합니다. 실제 H2 프로세스나 파일은 종료·삭제하지 않습니다. 현재 방식과 Kafka 방식에 모두 적용하며 메시지 저장/조회, 읽음 저장, Outbox 발행과 Consumer 처리를 멈춥니다. 제어 상태 조회와 DB 복구 API는 DB 없이 동작합니다. 중단 중 지표는 마지막 확인값입니다.
+
+저장 트랜잭션 실패 시 WebSocket은 `error / DB_UNAVAILABLE / retryable:true / requestId`를 돌려줍니다. 저장 ACK와 상대 전달은 하지 않습니다. 브라우저는 원래 요청 ID·본문·방·전송 방식을 sessionStorage에 보관하고, DB 복구를 확인하면 같은 요청을 자동 전송합니다. 이미 저장된 요청은 `(client_id, request_id)` 조회로 기존 메시지 ACK만 반환합니다. Kafka에서는 메시지와 Outbox가 함께 commit된 후 발행됩니다. Consumer의 DB 트랜잭션 실패는 offset을 commit하지 않고 재시도하며, 상대 전달은 DB commit 후에만 발생합니다.
+
+`KafkaDeliveryTest`는 두 전송 방식의 중단/복구/중복 재시도와 실제 H2 Outbox INSERT 예외를 검증합니다. INSERT 예외 시 먼저 실행된 메시지 INSERT도 rollback되고, 재시도 시 메시지와 Outbox가 한 건만 남는지 확인합니다. Pages 화면은 이 동작을 재현하는 브라우저 시뮬레이션입니다.

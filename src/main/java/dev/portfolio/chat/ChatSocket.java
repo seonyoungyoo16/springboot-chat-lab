@@ -17,8 +17,9 @@ public class ChatSocket extends TextWebSocketHandler {
     @Override public void afterConnectionEstablished(WebSocketSession socket) { socket.setTextMessageSizeLimit(16384); }
     // Single-process serialization keeps history -> live ordering and duplicate checks deterministic.
     @Override protected synchronized void handleTextMessage(WebSocketSession socket, TextMessage frame) throws Exception {
+        JsonNode input = null;
         try {
-            JsonNode input = json.readTree(frame.getPayload());
+            input = json.readTree(frame.getPayload());
             if (input == null || !input.isObject()) throw new IllegalArgumentException("JSON 객체가 필요합니다.");
             switch (input.path("type").asText()) {
                 case "join" -> join(socket, input);
@@ -27,6 +28,9 @@ public class ChatSocket extends TextWebSocketHandler {
                 case "typing" -> typing(socket, input);
                 default -> throw new IllegalArgumentException("지원하지 않는 메시지 유형입니다.");
             }
+        } catch (org.springframework.dao.DataAccessException | org.springframework.transaction.CannotCreateTransactionException unavailable) {
+            // Save transaction failed: no ACK, no delivery. The client retains the original request ID.
+            emit(socket, Map.of("type", "error", "code", "DB_UNAVAILABLE", "retryable", true, "operation", input==null?"":input.path("type").asText(), "requestId", input==null?"":input.path("requestId").asText(), "detail", "DB 저장/조회 실패 · 복구 후 같은 요청 ID로 재시도합니다."));
         } catch (com.fasterxml.jackson.core.JsonProcessingException | IllegalArgumentException error) {
             emit(socket, Map.of("type", "error", "code", "INVALID_INPUT", "detail", error instanceof IllegalArgumentException ? error.getMessage() : "올바른 JSON이 필요합니다."));
         }
@@ -50,7 +54,7 @@ public class ChatSocket extends TextWebSocketHandler {
         if (!saved.duplicate()&&saved.message().deliveryMode().equals("direct")) broadcast(member.roomId(), Map.of("type", "message", "message", saved.message()));
         emit(socket, Map.of("type", "ack", "requestId", requestId, "message", saved.message(), "duplicate", saved.duplicate()));
     }
-    @org.springframework.context.event.EventListener
+    @org.springframework.transaction.event.TransactionalEventListener(phase=org.springframework.transaction.event.TransactionPhase.AFTER_COMMIT)
     public synchronized void deliver(KafkaDelivery.Ready event){broadcast(event.message().roomId(),Map.of("type","message","message",event.message()));}
     private void read(WebSocketSession socket, JsonNode input) {
         var member = members.get(socket.getId());

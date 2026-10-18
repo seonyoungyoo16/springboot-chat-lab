@@ -126,6 +126,58 @@ class KafkaDeliveryTest {
             await().atMost(Duration.ofSeconds(10)).until(()->((Number)delivery.state().get("queued")).longValue()==0);
         }finally{delivery.setBrokerRunning(true);delivery.setRunning(true);}
     }
+    @Test void databaseOutageKeepsRequestWithoutAckThenStoresAndDeliversOnceInBothModes()throws Exception{
+        try(var a=new Peer("db-a","design");var b=new Peer("db-b","design")){
+            for(String mode:List.of("direct","kafka")){
+                String requestId="db-retry-"+mode;
+                var request=Map.of("type","send","mode",mode,"requestId",requestId,"body","DB 복구 "+mode);
+                control(Map.of("databaseRunning",false));
+                a.send(request);
+                var failure=a.take("error");
+                assertThat(failure.path("code").asText()).isEqualTo("DB_UNAVAILABLE");
+                assertThat(failure.path("retryable").asBoolean()).isTrue();
+                assertThat(failure.path("requestId").asText()).isEqualTo(requestId);
+                assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_messages WHERE client_id='db-a' AND request_id=?",Long.class,requestId)).isZero();
+                assertThat(b.messageWithin300ms()).isFalse();
+                assertThat(a.events.stream().noneMatch(e->e.path("type").asText().equals("ack"))).isTrue();
+                // The control endpoint remains usable without reading the unavailable DB.
+                var state=HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/demo/delivery")).GET().build(),HttpResponse.BodyHandlers.ofString());
+                assertThat(state.statusCode()).isEqualTo(200);assertThat(json.readTree(state.body()).path("databaseRunning").asBoolean()).isFalse();
+                control(Map.of("databaseRunning",true));
+                a.send(request);var ack=a.take("ack");long id=ack.path("message").path("id").asLong();
+                assertThat(ack.path("duplicate").asBoolean()).isFalse();
+                assertThat(ack.path("message").path("requestId").asText()).isEqualTo(requestId);
+                assertThat(b.take("message").path("message").path("id").asLong()).isEqualTo(id);
+                a.send(request);assertThat(a.take("ack").path("duplicate").asBoolean()).isTrue();
+                assertThat(b.messageWithin300ms()).isFalse();
+                assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_messages WHERE client_id='db-a' AND request_id=?",Long.class,requestId)).isEqualTo(1L);
+                if(mode.equals("kafka"))await().atMost(Duration.ofSeconds(10)).until(()->jdbc.queryForObject("SELECT COUNT(*) FROM chat_deliveries WHERE message_id=?",Long.class,id)==1L);
+            }
+        }finally{control(Map.of("databaseRunning",true));}
+    }
+    public static class FailOutboxOnce implements org.h2.api.Trigger {
+        static final java.util.concurrent.atomic.AtomicBoolean fail=new java.util.concurrent.atomic.AtomicBoolean();
+        @Override public void fire(java.sql.Connection connection,Object[] oldRow,Object[] newRow)throws java.sql.SQLException{
+            if(fail.getAndSet(false))throw new java.sql.SQLNonTransientConnectionException("injected write failure","08006");
+        }
+    }
+    @Test void actualOutboxWriteExceptionRollsBackMessageAndRetryUsesOriginalId()throws Exception{
+        jdbc.execute("CREATE TRIGGER fail_outbox BEFORE INSERT ON chat_outbox FOR EACH ROW CALL 'dev.portfolio.chat.KafkaDeliveryTest$FailOutboxOnce'");
+        try(var a=new Peer("db-tx-a","design");var b=new Peer("db-tx-b","design")){
+            FailOutboxOnce.fail.set(true);
+            var request=Map.of("type","send","mode","kafka","requestId","db-tx-retry","body","트랜잭션 롤백 후 재시도");
+            a.send(request);assertThat(a.take("error").path("code").asText()).isEqualTo("DB_UNAVAILABLE");
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_messages WHERE client_id='db-tx-a'",Long.class)).isZero();
+            assertThat(b.messageWithin300ms()).isFalse();
+            a.send(request);long id=a.take("ack").path("message").path("id").asLong();
+            assertThat(b.take("message").path("message").path("id").asLong()).isEqualTo(id);
+            a.send(request);assertThat(a.take("ack").path("duplicate").asBoolean()).isTrue();
+            assertThat(b.messageWithin300ms()).isFalse();
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_messages WHERE client_id='db-tx-a'",Long.class)).isEqualTo(1L);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox WHERE message_id=?",Long.class,id)).isEqualTo(1L);
+            await().atMost(Duration.ofSeconds(10)).until(()->jdbc.queryForObject("SELECT COUNT(*) FROM chat_deliveries WHERE message_id=?",Long.class,id)==1L);
+        }finally{jdbc.execute("DROP TRIGGER fail_outbox");FailOutboxOnce.fail.set(false);}
+    }
     @Test void invalidModeRollsBackBeforeAnyMessageOrOutboxWrite()throws Exception{
         long before=jdbc.queryForObject("SELECT COUNT(*) FROM chat_messages",Long.class);
         try(var a=new Peer("invalid-kafka","design")){

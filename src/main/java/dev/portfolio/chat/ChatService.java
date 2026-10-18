@@ -8,16 +8,19 @@ import org.springframework.jdbc.core.JdbcTemplate;
 public class ChatService {
     private final MessageRepository messages;
     private final JdbcTemplate jdbc;
-    ChatService(MessageRepository messages, JdbcTemplate jdbc) { this.messages = messages; this.jdbc = jdbc; }
+    private final DatabaseAvailability database;
+    ChatService(MessageRepository messages, JdbcTemplate jdbc, DatabaseAvailability database) { this.messages = messages; this.jdbc = jdbc; this.database=database; }
+    public void requireDatabase() { database.requireAvailable(); }
+    public boolean databaseRunning() { return database.isRunning(); }
     public record ReadView(String roomId, String clientId, long lastReadId, String deliveryMode) {}
     @Transactional(readOnly = true)
     public List<ReadView> reads(String roomId) {
-        validateRoom(roomId);
+        requireDatabase(); validateRoom(roomId);
         return jdbc.query("SELECT client_id, last_read_id, delivery_mode FROM chat_mode_reads WHERE room_id = ?", (row, index) -> new ReadView(roomId, row.getString(1), row.getLong(2),row.getString(3)), roomId);
     }
     @Transactional
     public ReadView markRead(String roomId, String clientId, long upToId) {
-        validateRoom(roomId); identifier(clientId);
+        requireDatabase(); validateRoom(roomId); identifier(clientId);
         var target=messages.findById(upToId).filter(message -> message.roomId.equals(roomId)).orElseThrow(() -> new IllegalArgumentException("현재 방의 저장된 메시지만 읽음 처리할 수 있습니다."));
         // ChatSocket serializes commands in this single-process demo; cursors never decrease.
         int updated = jdbc.update("UPDATE chat_mode_reads SET last_read_id = GREATEST(last_read_id, ?) WHERE room_id = ? AND client_id = ? AND delivery_mode = ?", upToId, roomId, clientId,target.deliveryMode);
@@ -40,10 +43,10 @@ public class ChatService {
     }
     private MessageView view(ChatMessage m) { return new MessageView(m.id, m.roomId, m.clientId, m.requestId, m.sender, m.body, m.createdAt, m.deliveryMode); }
     @Transactional(readOnly=true)
-    public MessageView message(long id){return view(messages.findById(id).orElseThrow());}
+    public MessageView message(long id){requireDatabase();return view(messages.findById(id).orElseThrow());}
     @Transactional(readOnly = true)
     public List<MessageView> history(String roomId) {
-        validateRoom(roomId);
+        requireDatabase(); validateRoom(roomId);
         return messages.findTop100ByRoomIdOrderByIdDesc(roomId).stream().sorted(Comparator.comparing(m -> m.id)).map(this::view).toList();
     }
     @Transactional
@@ -53,8 +56,8 @@ public class ChatService {
     @Transactional
     public Saved save(String roomId, String clientId, String requestId, String sender, String body, String mode) {
         if(!List.of("direct","kafka").contains(mode))throw new IllegalArgumentException("현재 방식 또는 Kafka 방식을 선택하세요.");
-        validateRoom(roomId); identifier(clientId); identifier(requestId); text(sender, 20, "이름"); body = text(body, 2000, "메시지");
-        var previous = messages.findByClientIdAndRequestId(clientId, requestId);
+        requireDatabase(); validateRoom(roomId); identifier(clientId); identifier(requestId); text(sender, 20, "이름"); body = text(body, 2000, "메시지");
+        requireDatabase(); var previous = messages.findByClientIdAndRequestId(clientId, requestId);
         if (previous.isPresent()) {
             if (!previous.get().roomId.equals(roomId)) throw new IllegalArgumentException("다른 방에서 사용한 요청 ID입니다.");
             return new Saved(view(previous.get()), true);

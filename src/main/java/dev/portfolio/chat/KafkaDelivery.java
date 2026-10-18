@@ -29,19 +29,24 @@ public class KafkaDelivery {
     private final ApplicationEventPublisher events;
     private volatile boolean brokerRunning=true,workerRunning=true;
     private volatile String publishError="";
+    private volatile Map<String,Object> lastState=Map.of("outboxPending",0L,"queued",0L,"pending",List.of());
     KafkaDelivery(JdbcTemplate jdbc, KafkaTemplate<String,String> kafka, KafkaListenerEndpointRegistry registry, ChatService service, ApplicationEventPublisher events) {
         this.jdbc=jdbc;this.kafka=kafka;this.registry=registry;this.service=service;this.events=events;
     }
+    @Bean org.springframework.kafka.listener.DefaultErrorHandler databaseRetryHandler(){return new org.springframework.kafka.listener.DefaultErrorHandler(new org.springframework.util.backoff.FixedBackOff(1000L,org.springframework.util.backoff.FixedBackOff.UNLIMITED_ATTEMPTS));}
     @Bean NewTopic chatDeliveryTopic(){return TopicBuilder.name(TOPIC).partitions(2).replicas(1).build();}
     @Scheduled(fixedDelayString="${chat.kafka.publish-delay:500}")
     public void publishPending(){
+        if(!service.databaseRunning())return;
         if(!brokerRunning){
             publishError="Kafka 연결 중단 체험";
             return; // Keep unpublished Outbox rows for the next recovery attempt.
         }
+        try {
+        service.requireDatabase();
         var rows=jdbc.queryForList("SELECT o.message_id, m.room_id FROM chat_outbox o JOIN chat_messages m ON m.id=o.message_id WHERE o.published=FALSE ORDER BY o.message_id LIMIT 100");
         for(var row:rows){
-            if(!brokerRunning)return;
+            if(!brokerRunning||!service.databaseRunning())return;
             long id=((Number)row.get("message_id")).longValue();String room=(String)row.get("room_id");
             try {
                 // Stable room partition and ordered relay preserve this demo's per-room append order.
@@ -50,10 +55,12 @@ public class KafkaDelivery {
                 publishError="";
             } catch(Exception unavailable){publishError=unavailable.getClass().getSimpleName();if(unavailable instanceof InterruptedException)Thread.currentThread().interrupt();return;}
         }
+        } catch(org.springframework.dao.DataAccessException unavailable){publishError="DB unavailable";}
     }
     @KafkaListener(id=GROUP, topics=TOPIC, groupId=GROUP)
     @Transactional
     public void consume(ConsumerRecord<String,String> record){
+        service.requireDatabase();
         long id=Long.parseLong(record.value());
         if(jdbc.queryForObject("SELECT COUNT(*) FROM chat_deliveries WHERE message_id=?",Long.class,id)>0)return;
         var message=service.message(id);
@@ -71,18 +78,24 @@ public class KafkaDelivery {
         if(running)publishError="";
         applyAvailability();
     }
-    private void applyAvailability(){
+    public void applyAvailability(){
         var consumer=registry.getListenerContainer(GROUP);
-        if(brokerRunning&&workerRunning)consumer.resume();else consumer.pause();
+        if(brokerRunning&&workerRunning&&service.databaseRunning())consumer.resume();else consumer.pause();
     }
     public Map<String,Object> state(){
         var consumer=registry.getListenerContainer(GROUP);
+        if(!service.databaseRunning()){
+            var state=new LinkedHashMap<String,Object>(lastState);
+            state.putAll(Map.of("enabled",true,"running",workerRunning,"brokerRunning",brokerRunning,"paused",consumer.isContainerPaused(),"metricsStale",true));
+            return state; // Control endpoints remain available while DB operations are blocked.
+        }
         long unpublished=jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox WHERE published=FALSE",Long.class);
         long queued=jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox o WHERE published=TRUE AND NOT EXISTS (SELECT 1 FROM chat_deliveries d WHERE d.message_id=o.message_id)",Long.class);
         var pending=jdbc.queryForList("SELECT m.id, m.room_id, m.body, o.published, o.kafka_partition, o.kafka_offset FROM chat_outbox o JOIN chat_messages m ON m.id=o.message_id WHERE NOT EXISTS (SELECT 1 FROM chat_deliveries d WHERE d.message_id=o.message_id) ORDER BY m.id LIMIT 100");
         var state=new LinkedHashMap<String,Object>();
         state.putAll(Map.of("enabled",true,"running",workerRunning,"paused",consumer.isContainerPaused(),"outboxPending",unpublished,"queued",queued,"pending",pending,"topic",TOPIC));
         state.put("brokerRunning",brokerRunning);state.put("publishError",publishError);state.put("brokerFaultSimulation",true);
+        state.put("metricsStale",false);lastState=Map.copyOf(state);
         return state;
     }
 }
