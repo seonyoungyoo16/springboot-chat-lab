@@ -13,6 +13,8 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.annotation.DirtiesContext;
+import static org.mockito.Mockito.*;
+import static org.mockito.ArgumentMatchers.*;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import java.time.Duration;
@@ -26,6 +28,9 @@ class KafkaDeliveryTest {
     @Autowired KafkaDelivery delivery;
     @Autowired JdbcTemplate jdbc;
     @Autowired KafkaTemplate<String,String> kafka;
+    @Autowired org.springframework.kafka.config.KafkaListenerEndpointRegistry registry;
+    @Autowired ChatService service;
+    @Autowired org.springframework.context.ApplicationEventPublisher events;
     class Peer implements WebSocket.Listener,AutoCloseable {
         final BlockingQueue<JsonNode> events=new LinkedBlockingQueue<>();final StringBuilder buffer=new StringBuilder();WebSocket socket;
         Peer(String client,String room)throws Exception{socket=HttpClient.newHttpClient().newWebSocketBuilder().buildAsync(URI.create("ws://localhost:"+port+"/ws/chat"),this).join();send(Map.of("type","join","clientId",client,"roomId",room,"name",client));take("joined");}
@@ -37,6 +42,7 @@ class KafkaDeliveryTest {
         @Override public void close(){socket.sendClose(1000,"done").join();}
     }
     @Test void selectableRoutesPauseAccumulateResumeAndDeduplicate()throws Exception{
+        long beforeOutbox=jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox",Long.class),beforeProcessed=jdbc.queryForObject("SELECT COUNT(*) FROM chat_deliveries",Long.class);
         delivery.setRunning(false);
         await().atMost(Duration.ofSeconds(10)).until(()->Boolean.TRUE.equals(delivery.state().get("paused")));
         try(var a=new Peer("kafka-a","lobby");var b=new Peer("kafka-b","lobby");var outside=new Peer("kafka-out","design")){
@@ -48,10 +54,10 @@ class KafkaDeliveryTest {
             }
             await().atMost(Duration.ofSeconds(15)).until(()->((Number)delivery.state().get("queued")).longValue()==3);
             assertThat(b.messageWithin300ms()).isFalse();
-            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox",Long.class)).isEqualTo(3);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox",Long.class)).isEqualTo(beforeOutbox+3);
             a.send(Map.of("type","send","mode","kafka","requestId","kafka-0","body","대기 0"));
             assertThat(a.take("ack").path("duplicate").asBoolean()).isTrue();
-            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox",Long.class)).isEqualTo(3);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox",Long.class)).isEqualTo(beforeOutbox+3);
             // Direct delivery bypasses the stopped Kafka consumer.
             a.send(Map.of("type","send","mode","direct","requestId","direct-1","body","직접 전달"));
             var direct=b.take("message").path("message");assertThat(direct.path("body").asText()).isEqualTo("직접 전달");a.take("ack");
@@ -69,8 +75,56 @@ class KafkaDeliveryTest {
             // Relay retries can append the same business event again: consumer dedup still applies.
             kafka.send(KafkaDelivery.TOPIC,0,"lobby",String.valueOf(ids.getFirst())).get(5,TimeUnit.SECONDS);
             assertThat(b.messageWithin300ms()).isFalse();
-            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_deliveries",Long.class)).isEqualTo(3);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_deliveries",Long.class)).isEqualTo(beforeProcessed+3);
         }
+    }
+    void control(Map<String,Boolean> body)throws Exception{
+        var request=HttpRequest.newBuilder(URI.create("http://localhost:"+port+"/api/demo/delivery")).header("Content-Type","application/json").PUT(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(body))).build();
+        assertThat(HttpClient.newHttpClient().send(request,HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(200);
+    }
+    @Test void brokerOutageKeepsOutboxThenRecoveryHonorsStoppedWorker()throws Exception{
+        control(Map.of("brokerRunning",false));delivery.setRunning(false);
+        await().atMost(Duration.ofSeconds(10)).until(()->Boolean.TRUE.equals(delivery.state().get("paused")));
+        try(var a=new Peer("outage-a","design");var b=new Peer("outage-b","design")){
+            var ids=new ArrayList<Long>();
+            for(int i=0;i<2;i++){
+                a.send(Map.of("type","send","mode","kafka","requestId","outage-"+i,"body","Outbox 보관 "+i));
+                ids.add(a.take("ack").path("message").path("id").asLong());
+            }
+            delivery.publishPending();
+            assertThat(delivery.state().get("outboxPending")).isEqualTo(2L);
+            assertThat(delivery.state().get("queued")).isEqualTo(0L);
+            assertThat(b.messageWithin300ms()).isFalse();
+            a.send(Map.of("type","send","mode","kafka","requestId","outage-0","body","Outbox 보관 0"));assertThat(a.take("ack").path("duplicate").asBoolean()).isTrue();
+            assertThat(delivery.state().get("outboxPending")).isEqualTo(2L);
+            control(Map.of("brokerRunning",true));
+            await().atMost(Duration.ofSeconds(15)).until(()->((Number)delivery.state().get("outboxPending")).longValue()==0);
+            assertThat(delivery.state().get("running")).isEqualTo(false);
+            assertThat(delivery.state().get("queued")).isEqualTo(2L);
+            assertThat(b.messageWithin300ms()).isFalse();
+            delivery.setRunning(true);
+            assertThat(b.take("message").path("message").path("id").asLong()).isEqualTo(ids.getFirst());
+            assertThat(b.take("message").path("message").path("id").asLong()).isEqualTo(ids.getLast());
+            await().atMost(Duration.ofSeconds(10)).until(()->((Number)delivery.state().get("queued")).longValue()==0);
+            assertThat(b.messageWithin300ms()).isFalse();
+        }finally{delivery.setBrokerRunning(true);delivery.setRunning(true);}
+    }
+    @Test void producerSendFailureRetainsUnpublishedRowAndRetriesAfterRecovery()throws Exception{
+        delivery.setRunning(false);delivery.setBrokerRunning(false);
+        // Inject a send failure; recovery uses the real Kafka producer and embedded broker.
+        KafkaTemplate<String,String> failing=mock(KafkaTemplate.class);
+        var failedPublisher=new KafkaDelivery(jdbc,failing,registry,service,events);
+        doThrow(new org.springframework.kafka.KafkaException("injected outage")).when(failing).send(eq(KafkaDelivery.TOPIC),anyInt(),anyString(),anyString());
+        try(var a=new Peer("failed-a","design");var b=new Peer("failed-b","design")){
+            a.send(Map.of("type","send","mode","kafka","requestId","send-failure","body","발행 실패 후 복구"));long id=a.take("ack").path("message").path("id").asLong();
+            failedPublisher.publishPending();assertThat(failedPublisher.state().get("publishError")).isEqualTo("KafkaException");
+            assertThat(jdbc.queryForObject("SELECT published FROM chat_outbox WHERE message_id=?",Boolean.class,id)).isFalse();
+            assertThat(b.messageWithin300ms()).isFalse();
+            delivery.setBrokerRunning(true);
+            await().atMost(Duration.ofSeconds(15)).until(()->jdbc.queryForObject("SELECT published FROM chat_outbox WHERE message_id=?",Boolean.class,id));
+            delivery.setRunning(true);assertThat(b.take("message").path("message").path("id").asLong()).isEqualTo(id);
+            await().atMost(Duration.ofSeconds(10)).until(()->((Number)delivery.state().get("queued")).longValue()==0);
+        }finally{delivery.setBrokerRunning(true);delivery.setRunning(true);}
     }
     @Test void invalidModeRollsBackBeforeAnyMessageOrOutboxWrite()throws Exception{
         long before=jdbc.queryForObject("SELECT COUNT(*) FROM chat_messages",Long.class);

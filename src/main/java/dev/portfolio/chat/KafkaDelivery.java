@@ -27,20 +27,28 @@ public class KafkaDelivery {
     private final KafkaListenerEndpointRegistry registry;
     private final ChatService service;
     private final ApplicationEventPublisher events;
+    private volatile boolean brokerRunning=true,workerRunning=true;
+    private volatile String publishError="";
     KafkaDelivery(JdbcTemplate jdbc, KafkaTemplate<String,String> kafka, KafkaListenerEndpointRegistry registry, ChatService service, ApplicationEventPublisher events) {
         this.jdbc=jdbc;this.kafka=kafka;this.registry=registry;this.service=service;this.events=events;
     }
     @Bean NewTopic chatDeliveryTopic(){return TopicBuilder.name(TOPIC).partitions(2).replicas(1).build();}
     @Scheduled(fixedDelayString="${chat.kafka.publish-delay:500}")
     public void publishPending(){
+        if(!brokerRunning){
+            publishError="Kafka 연결 중단 체험";
+            return; // Keep unpublished Outbox rows for the next recovery attempt.
+        }
         var rows=jdbc.queryForList("SELECT o.message_id, m.room_id FROM chat_outbox o JOIN chat_messages m ON m.id=o.message_id WHERE o.published=FALSE ORDER BY o.message_id LIMIT 100");
         for(var row:rows){
+            if(!brokerRunning)return;
             long id=((Number)row.get("message_id")).longValue();String room=(String)row.get("room_id");
             try {
                 // Stable room partition and ordered relay preserve this demo's per-room append order.
                 var result=kafka.send(TOPIC, room.equals("lobby")?0:1, room, String.valueOf(id)).get(5,TimeUnit.SECONDS);
                 jdbc.update("UPDATE chat_outbox SET published=TRUE, kafka_partition=?, kafka_offset=? WHERE message_id=?",result.getRecordMetadata().partition(),result.getRecordMetadata().offset(),id);
-            } catch(Exception unavailable){if(unavailable instanceof InterruptedException)Thread.currentThread().interrupt();return;}
+                publishError="";
+            } catch(Exception unavailable){publishError=unavailable.getClass().getSimpleName();if(unavailable instanceof InterruptedException)Thread.currentThread().interrupt();return;}
         }
     }
     @KafkaListener(id=GROUP, topics=TOPIC, groupId=GROUP)
@@ -54,14 +62,27 @@ public class KafkaDelivery {
         // Container commits its Kafka offset after this listener and its DB transaction succeed.
     }
     public void setRunning(boolean running){
+        workerRunning=running;
+        applyAvailability();
+    }
+    /** Fault injection only: leave the external broker process and its retained data intact. */
+    public void setBrokerRunning(boolean running){
+        brokerRunning=running;
+        if(running)publishError="";
+        applyAvailability();
+    }
+    private void applyAvailability(){
         var consumer=registry.getListenerContainer(GROUP);
-        if(running)consumer.resume();else consumer.pause();
+        if(brokerRunning&&workerRunning)consumer.resume();else consumer.pause();
     }
     public Map<String,Object> state(){
         var consumer=registry.getListenerContainer(GROUP);
         long unpublished=jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox WHERE published=FALSE",Long.class);
         long queued=jdbc.queryForObject("SELECT COUNT(*) FROM chat_outbox o WHERE published=TRUE AND NOT EXISTS (SELECT 1 FROM chat_deliveries d WHERE d.message_id=o.message_id)",Long.class);
         var pending=jdbc.queryForList("SELECT m.id, m.room_id, m.body, o.published, o.kafka_partition, o.kafka_offset FROM chat_outbox o JOIN chat_messages m ON m.id=o.message_id WHERE NOT EXISTS (SELECT 1 FROM chat_deliveries d WHERE d.message_id=o.message_id) ORDER BY m.id LIMIT 100");
-        return Map.of("enabled",true,"running",!consumer.isPauseRequested(),"paused",consumer.isContainerPaused(),"outboxPending",unpublished,"queued",queued,"pending",pending,"topic",TOPIC);
+        var state=new LinkedHashMap<String,Object>();
+        state.putAll(Map.of("enabled",true,"running",workerRunning,"paused",consumer.isContainerPaused(),"outboxPending",unpublished,"queued",queued,"pending",pending,"topic",TOPIC));
+        state.put("brokerRunning",brokerRunning);state.put("publishError",publishError);state.put("brokerFaultSimulation",true);
+        return state;
     }
 }

@@ -90,3 +90,15 @@ http://localhost:8089 를 두 창에서 열어 같은 방에 연결합니다. Ka
 이 데모에서 수신 서버와 전달 서버는 같은 JVM 안의 서로 다른 역할입니다. 중단 버튼은 Consumer 역할만 멈추며 프로세스·WebSocket·DB는 계속 동작합니다. 여러 WebSocket 서버로 확장하려면 접속 위치 라우팅과 공유 DB, 인증을 추가해야 합니다. 같은 consumer group은 작업을 분담하므로 모든 서버에 자동 방송되지 않습니다.
 
 `KafkaDeliveryTest`는 실제 KRaft 브로커를 띄워 중단 중 누적, 저장 ACK, Direct 우회 전달, 복구 후 같은 방 순서, 재전송/이벤트 재처리 중복 방지와 경로별 읽음을 확인합니다. GitHub Pages 체험은 이 구현 규칙을 보여주는 브라우저 시뮬레이션입니다.
+
+## Kafka 연결 중단 / Outbox 복구 체험
+
+Kafka 중단과 전달 서버 중단을 독립적으로 선택합니다. `PUT /api/demo/delivery`의 선택 필드는 `brokerRunning`과 `running`이며 지정한 필드만 변경합니다. 기존 `{ "running": false }` 요청도 그대로 지원합니다.
+
+- Kafka 중단: Outbox 발행을 보류하고 Consumer를 일시 중지합니다. WebSocket, DB 저장과 저장 ACK는 유지합니다. 새 메시지는 `published=FALSE`, partition/offset 미지정 상태로 Outbox에 남습니다.
+- Kafka 복구: Outbox를 원래 메시지 ID와 방 파티션으로 다시 발행합니다. 전달 서버가 실행 중이면 이어서 수신합니다. 전달 서버를 따로 중단했다면 Kafka에 발행된 채로 대기하며 자동으로 서버를 켜지 않습니다.
+- 이미 Kafka에 발행된 기록은 중단/복구 시 지우지 않습니다. 진행 중인 한 번의 발행이나 전달은 완료될 수 있습니다. 재발행 가능성은 기존 이벤트 ID/메시지 ID 중복 처리로 다룹니다.
+- UI의 Kafka 중단 버튼은 **연결 불가 상태를 주입하는 장애 체험**입니다. 외부 브로커 프로세스를 종료하거나 Kafka 로그를 삭제하지 않습니다. `brokerRunning`은 이 체험의 연결 허용 상태이며 실제 브로커 health 검사 결과가 아닙니다.
+- 실제 `KafkaTemplate.send`가 실패해도 Outbox를 발행 완료로 갱신하지 않고 다음 스케줄에 재시도합니다. `publishError`에는 예외 종류만 표시합니다. 테스트는 전송 실패를 주입한 뒤 실제 임베디드 Kafka로 복구 발행하는 경우도 별도로 확인합니다.
+
+체험: Kafka 방식 선택 → Kafka 중단 → 메시지 여러 개 전송 → Outbox 미발행 수 증가/상대 미수신 확인 → Kafka 복구 → 발행 및 전달 확인. 두 역할을 모두 중단했다면 Kafka 복구 후 대기가 Kafka로 옮겨가는 것과 전달 서버 복구 후 수신되는 것을 차례로 확인합니다.

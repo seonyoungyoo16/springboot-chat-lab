@@ -84,10 +84,12 @@ $('body').addEventListener('input',inputTyping);$('body').addEventListener('blur
 
 let deliveryState={enabled:false,running:false};
 async function refreshDelivery(){try{const response=await fetch('/api/demo/delivery');if(!response.ok)return;deliveryState=await response.json();
-  $('delivery-state').textContent=deliveryState.enabled?(deliveryState.running?'전달 서버 실행 중':'전달 서버 중단')+' · Outbox '+deliveryState.outboxPending+' · Kafka 대기 '+deliveryState.queued:'Kafka 비활성 · KAFKA_ENABLED=true와 브로커가 필요합니다.';
+  $('broker-toggle').disabled=!deliveryState.enabled||!deliveryState.controls;$('broker-toggle').textContent=deliveryState.brokerRunning===false?'Kafka 복구':'Kafka 중단';
+  $('delivery-state').textContent=deliveryState.enabled?(deliveryState.brokerRunning===false?'Kafka 중단 · ':'Kafka 연결 허용 · ')+(deliveryState.running?'전달 서버 실행 중':'전달 서버 중단')+' · Outbox '+deliveryState.outboxPending+' · Kafka 대기 '+deliveryState.queued+(deliveryState.publishError?' · 발행 보류: '+deliveryState.publishError:''):'Kafka 비활성 · KAFKA_ENABLED=true와 브로커가 필요합니다.';
   $('worker-toggle').disabled=!deliveryState.enabled||!deliveryState.controls;$('worker-toggle').textContent=deliveryState.running?'전달 서버 중단':'전달 서버 복구';
   $('kafka-option').disabled=!deliveryState.enabled;
 }catch{}}
+$('broker-toggle').onclick=async()=>{await fetch('/api/demo/delivery',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({brokerRunning:deliveryState.brokerRunning===false})});await refreshDelivery()};
 $('worker-toggle').onclick=async()=>{await fetch('/api/demo/delivery',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({running:!deliveryState.running})});await refreshDelivery()};
 $('mode').onchange=()=>{$('notice').textContent=$('mode').value==='kafka'?'Kafka 경유 · 저장 ACK 후 비동기 전달':'현재 방식 · 저장 후 직접 방송'};
 setInterval(refreshDelivery,1000);refreshDelivery();
