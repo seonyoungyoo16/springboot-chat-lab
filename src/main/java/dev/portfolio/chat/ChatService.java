@@ -9,23 +9,23 @@ public class ChatService {
     private final MessageRepository messages;
     private final JdbcTemplate jdbc;
     ChatService(MessageRepository messages, JdbcTemplate jdbc) { this.messages = messages; this.jdbc = jdbc; }
-    public record ReadView(String roomId, String clientId, long lastReadId) {}
+    public record ReadView(String roomId, String clientId, long lastReadId, String deliveryMode) {}
     @Transactional(readOnly = true)
     public List<ReadView> reads(String roomId) {
         validateRoom(roomId);
-        return jdbc.query("SELECT client_id, last_read_id FROM chat_reads WHERE room_id = ?", (row, index) -> new ReadView(roomId, row.getString(1), row.getLong(2)), roomId);
+        return jdbc.query("SELECT client_id, last_read_id, delivery_mode FROM chat_mode_reads WHERE room_id = ?", (row, index) -> new ReadView(roomId, row.getString(1), row.getLong(2),row.getString(3)), roomId);
     }
     @Transactional
     public ReadView markRead(String roomId, String clientId, long upToId) {
         validateRoom(roomId); identifier(clientId);
-        messages.findById(upToId).filter(message -> message.roomId.equals(roomId)).orElseThrow(() -> new IllegalArgumentException("현재 방의 저장된 메시지만 읽음 처리할 수 있습니다."));
+        var target=messages.findById(upToId).filter(message -> message.roomId.equals(roomId)).orElseThrow(() -> new IllegalArgumentException("현재 방의 저장된 메시지만 읽음 처리할 수 있습니다."));
         // ChatSocket serializes commands in this single-process demo; cursors never decrease.
-        int updated = jdbc.update("UPDATE chat_reads SET last_read_id = GREATEST(last_read_id, ?) WHERE room_id = ? AND client_id = ?", upToId, roomId, clientId);
-        if (updated == 0) jdbc.update("INSERT INTO chat_reads(room_id, client_id, last_read_id) VALUES (?, ?, ?)", roomId, clientId, upToId);
-        long saved = jdbc.queryForObject("SELECT last_read_id FROM chat_reads WHERE room_id = ? AND client_id = ?", Long.class, roomId, clientId);
-        return new ReadView(roomId, clientId, saved);
+        int updated = jdbc.update("UPDATE chat_mode_reads SET last_read_id = GREATEST(last_read_id, ?) WHERE room_id = ? AND client_id = ? AND delivery_mode = ?", upToId, roomId, clientId,target.deliveryMode);
+        if (updated == 0) jdbc.update("INSERT INTO chat_mode_reads(room_id, client_id, last_read_id, delivery_mode) VALUES (?, ?, ?, ?)", roomId, clientId, upToId,target.deliveryMode);
+        long saved = jdbc.queryForObject("SELECT last_read_id FROM chat_mode_reads WHERE room_id = ? AND client_id = ? AND delivery_mode = ?", Long.class, roomId, clientId,target.deliveryMode);
+        return new ReadView(roomId, clientId, saved,target.deliveryMode);
     }
-    public record MessageView(Long id, String roomId, String clientId, String requestId, String sender, String body, Instant createdAt) {}
+    public record MessageView(Long id, String roomId, String clientId, String requestId, String sender, String body, Instant createdAt, String deliveryMode) {}
     public record Saved(MessageView message, boolean duplicate) {}
     public void validateRoom(String roomId) {
         if (!List.of("lobby", "design").contains(roomId)) throw new IllegalArgumentException("존재하지 않는 채팅방입니다.");
@@ -38,7 +38,9 @@ public class ChatService {
         if (value == null || !value.matches("[A-Za-z0-9_-]{1,80}")) throw new IllegalArgumentException("요청 식별자가 올바르지 않습니다.");
         return value;
     }
-    private MessageView view(ChatMessage m) { return new MessageView(m.id, m.roomId, m.clientId, m.requestId, m.sender, m.body, m.createdAt); }
+    private MessageView view(ChatMessage m) { return new MessageView(m.id, m.roomId, m.clientId, m.requestId, m.sender, m.body, m.createdAt, m.deliveryMode); }
+    @Transactional(readOnly=true)
+    public MessageView message(long id){return view(messages.findById(id).orElseThrow());}
     @Transactional(readOnly = true)
     public List<MessageView> history(String roomId) {
         validateRoom(roomId);
@@ -46,13 +48,20 @@ public class ChatService {
     }
     @Transactional
     public Saved save(String roomId, String clientId, String requestId, String sender, String body) {
+        return save(roomId,clientId,requestId,sender,body,"direct");
+    }
+    @Transactional
+    public Saved save(String roomId, String clientId, String requestId, String sender, String body, String mode) {
+        if(!List.of("direct","kafka").contains(mode))throw new IllegalArgumentException("현재 방식 또는 Kafka 방식을 선택하세요.");
         validateRoom(roomId); identifier(clientId); identifier(requestId); text(sender, 20, "이름"); body = text(body, 2000, "메시지");
         var previous = messages.findByClientIdAndRequestId(clientId, requestId);
         if (previous.isPresent()) {
             if (!previous.get().roomId.equals(roomId)) throw new IllegalArgumentException("다른 방에서 사용한 요청 ID입니다.");
             return new Saved(view(previous.get()), true);
         }
-        var message = messages.saveAndFlush(new ChatMessage(roomId, clientId, requestId, sender, body));
+        var entity=new ChatMessage(roomId, clientId, requestId, sender, body);entity.deliveryMode=mode;
+        var message = messages.saveAndFlush(entity);
+        if(mode.equals("kafka"))jdbc.update("INSERT INTO chat_outbox(message_id) VALUES (?)",message.id);
         return new Saved(view(message), false);
     }
 }

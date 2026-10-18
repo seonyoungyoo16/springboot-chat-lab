@@ -16,3 +16,27 @@ CREATE TABLE IF NOT EXISTS chat_reads (
   PRIMARY KEY(room_id, client_id),
   FOREIGN KEY(last_read_id) REFERENCES chat_messages(id)
 );
+
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS delivery_mode VARCHAR(10) DEFAULT 'direct' NOT NULL;
+CREATE TABLE IF NOT EXISTS chat_outbox (
+  message_id BIGINT PRIMARY KEY REFERENCES chat_messages(id),
+  published BOOLEAN NOT NULL DEFAULT FALSE,
+  kafka_partition INT,
+  kafka_offset BIGINT
+);
+CREATE TABLE IF NOT EXISTS chat_deliveries (
+  message_id BIGINT PRIMARY KEY REFERENCES chat_messages(id),
+  kafka_partition INT NOT NULL,
+  kafka_offset BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_mode_reads (
+  room_id VARCHAR(30) NOT NULL,
+  client_id VARCHAR(80) NOT NULL,
+  delivery_mode VARCHAR(10) NOT NULL,
+  last_read_id BIGINT NOT NULL REFERENCES chat_messages(id),
+  PRIMARY KEY(room_id, client_id, delivery_mode)
+);
+INSERT INTO chat_mode_reads(room_id,client_id,delivery_mode,last_read_id)
+SELECT r.room_id,r.client_id,'direct',r.last_read_id FROM chat_reads r
+WHERE NOT EXISTS(SELECT 1 FROM chat_mode_reads n WHERE n.room_id=r.room_id AND n.client_id=r.client_id AND n.delivery_mode='direct');

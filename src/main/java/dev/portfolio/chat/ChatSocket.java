@@ -8,6 +8,7 @@ import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 @Component
 public class ChatSocket extends TextWebSocketHandler {
+    @org.springframework.beans.factory.annotation.Value("${chat.kafka.enabled:false}") private boolean kafkaEnabled;
     private final ChatService service;
     private final ObjectMapper json;
     private final Map<String, Member> members = new HashMap<>();
@@ -43,10 +44,14 @@ public class ChatSocket extends TextWebSocketHandler {
         var member = members.get(socket.getId());
         if (member == null) throw new IllegalArgumentException("먼저 채팅방에 입장해 주세요.");
         String requestId = input.path("requestId").asText();
-        var saved = service.save(member.roomId(), member.clientId(), requestId, member.name(), input.path("body").asText());
-        if (!saved.duplicate()) broadcast(member.roomId(), Map.of("type", "message", "message", saved.message()));
+        String mode=input.path("mode").asText("direct");
+        if(mode.equals("kafka")&&!kafkaEnabled)throw new IllegalArgumentException("Kafka 설정을 켜고 브로커를 실행하세요.");
+        var saved = service.save(member.roomId(), member.clientId(), requestId, member.name(), input.path("body").asText(),mode);
+        if (!saved.duplicate()&&saved.message().deliveryMode().equals("direct")) broadcast(member.roomId(), Map.of("type", "message", "message", saved.message()));
         emit(socket, Map.of("type", "ack", "requestId", requestId, "message", saved.message(), "duplicate", saved.duplicate()));
     }
+    @org.springframework.context.event.EventListener
+    public synchronized void deliver(KafkaDelivery.Ready event){broadcast(event.message().roomId(),Map.of("type","message","message",event.message()));}
     private void read(WebSocketSession socket, JsonNode input) {
         var member = members.get(socket.getId());
         if (member == null) throw new IllegalArgumentException("먼저 채팅방에 입장해 주세요.");

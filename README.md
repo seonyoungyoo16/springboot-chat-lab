@@ -61,3 +61,32 @@ docker run --rm -p 8089:8089 -v chat-data:/app/data chat-lab
 ## ACK 수신 전 연결 끊김 체험
 
 `다음 전송: 서버 저장 후 ACK 수신 전 연결 끊기`를 체크하고 보냅니다. 클라이언트가 저장된 메시지 방송을 받는 순간 소켓을 닫고, 해당 연결의 뒤늦은 ACK를 무시하는 의도적인 장애 체험입니다. 실제 네트워크 장애를 발생시키는 기능은 아닙니다. 수신 방송이나 재접속 기록만으로 대기 요청을 지우지 않고 ACK를 받아야 지웁니다. 다시 연결하면 sessionStorage에 보관한 같은 requestId·본문을 자동 재전송합니다. 서버는 기존 메시지 ID로 ACK하고 INSERT와 두 번째 방송은 생략합니다. 수동 장애 체험은 연결 버튼으로 복귀하며, 일반적인 예기치 않은 끊김은 기존 재접속 타이머를 사용합니다.
+
+## 현재 방식 / Kafka 방식 선택
+
+같은 WebSocket `send` 요청에 `mode: "direct"` 또는 `mode: "kafka"`를 지정합니다. 생략하면 기존 direct입니다. 서버 UI에서도 전송 방식을 선택할 수 있고, 대기 요청에는 선택한 mode를 함께 보관하므로 재전송 도중 경로가 바뀌지 않습니다.
+
+- Direct: 대화 저장/commit → 같은 방에 직접 방송 → 저장 ACK.
+- Kafka: 대화와 `chat_outbox`를 같은 DB 트랜잭션으로 저장 → 저장 ACK. 별도 릴레이가 미발행 Outbox를 Kafka에 발행하고, Consumer가 같은 방에 WebSocket으로 전달한 뒤 처리 기록과 offset을 갱신합니다. ACK는 Kafka 소비 완료나 상대 읽음을 의미하지 않습니다.
+- `chat-delivery` 토픽 2개 파티션: lobby=0, design=1. 이 단일 릴레이는 메시지 ID 순으로 발행합니다. Consumer를 중단해도 Outbox 발행은 계속됩니다.
+- DB 저장 후 발행 전 장애는 Outbox 재시도로 복구합니다. 발행 후 Outbox 갱신 전 장애로 같은 이벤트가 다시 발행될 수 있어 `chat_deliveries(message_id)`와 화면 메시지 ID로 중복을 처리합니다. DB와 WebSocket을 포함한 exactly-once 전달을 보장하지 않습니다.
+- 두 경로를 섞으면 Kafka 메시지가 늦게 도착할 수 있습니다. 읽음 위치는 `chat_mode_reads`에 방·참가자·전송 방식별로 저장해, 나중에 보낸 Direct 메시지를 읽은 것으로 앞서 대기 중이던 Kafka 메시지가 읽음 처리되지 않게 합니다. 기존 `chat_reads`는 삭제하지 않고 Direct 읽음으로 이관합니다.
+
+### 실제 브로커와 실행
+
+Java 21과 Maven만으로 실제 단일 노드 Kafka를 띄우는 로컬 데모입니다. 이 런처의 Kafka와 H2 기록은 임시이며 종료 시 초기화됩니다.
+
+```powershell
+.\scripts\maven.ps1 test-compile exec:java '-Dexec.mainClass=dev.portfolio.chat.KafkaDemoLauncher' '-Dexec.classpathScope=test'
+```
+
+http://localhost:8089 를 두 창에서 열어 같은 방에 연결합니다. Kafka 방식 선택 → 전달 서버 중단 → 메시지 여러 개 전송 → Kafka 대기 수 확인 → 전달 서버 복구 순서로 체험합니다. Consumer가 멈춰 있어도 Direct 경로는 즉시 전달됩니다.
+
+기존 브로커를 사용할 때는 `KAFKA_ENABLED=true`, `KAFKA_BOOTSTRAP_SERVERS=localhost:9092`로 설정하고 Java 앱을 실행합니다. 데모 중단/복구 API를 쓰려면 `DEMO_CONTROLS_ENABLED=true`도 설정합니다. 기본값은 Kafka와 변경 API 모두 비활성입니다.
+
+`GET /api/demo/delivery`: Consumer 상태, Outbox 미발행 수, 발행 후 미처리 이벤트 수와 목록. 대기 수는 애플리케이션 Outbox/처리 테이블에서 계산하며 Kafka 관리 API의 consumer lag 지표는 아닙니다.
+`PUT /api/demo/delivery` + `{ "running": false }` / true: Consumer pause/resume. 진행 중인 한 건은 완료될 수 있습니다.
+
+이 데모에서 수신 서버와 전달 서버는 같은 JVM 안의 서로 다른 역할입니다. 중단 버튼은 Consumer 역할만 멈추며 프로세스·WebSocket·DB는 계속 동작합니다. 여러 WebSocket 서버로 확장하려면 접속 위치 라우팅과 공유 DB, 인증을 추가해야 합니다. 같은 consumer group은 작업을 분담하므로 모든 서버에 자동 방송되지 않습니다.
+
+`KafkaDeliveryTest`는 실제 KRaft 브로커를 띄워 중단 중 누적, 저장 ACK, Direct 우회 전달, 복구 후 같은 방 순서, 재전송/이벤트 재처리 중복 방지와 경로별 읽음을 확인합니다. GitHub Pages 체험은 이 구현 규칙을 보여주는 브라우저 시뮬레이션입니다.

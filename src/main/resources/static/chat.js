@@ -1,7 +1,7 @@
 const $=id=>document.getElementById(id);
 const clientId=sessionStorage.getItem('chat-client')||crypto.randomUUID();sessionStorage.setItem('chat-client',clientId);
 let socket=null,wanted=false,joined=false,retry=null,attempt=0,generation=0,room='lobby',name='참가자',viewOpen=true;
-let messages=new Map(),pending=[],reads=new Map(),readRequested=0,cutRequest=null;
+let messages=new Map(),pending=[],reads=new Map(),readRequested=new Map(),cutRequest=null;
 try{pending=JSON.parse(sessionStorage.getItem('chat-pending')||'[]')}catch{}
 let typingSent=false,lastTypingAt=0,typingIdle=null;const peerTyping=new Map();
 const store=()=>{try{sessionStorage.setItem('chat-pending',JSON.stringify(pending))}catch{}};
@@ -9,20 +9,20 @@ function status(text){$('status').textContent=text;$('body').disabled=!joined;$(
 function render(follow=true){
   const top=$('messages').scrollTop,atBottom=$('messages').scrollHeight-top-$('messages').clientHeight<24;
   const rows=[...messages.values()].sort((a,b)=>a.id-b.id).slice(-100);
-  $('closed-count').textContent='받은 메시지 '+rows.length+'건 · 안 읽은 메시지 '+rows.filter(m=>m.clientId!==clientId&&m.id>(reads.get(clientId)?.lastReadId||0)).length+'건';
+  $('closed-count').textContent='받은 메시지 '+rows.length+'건 · 안 읽은 메시지 '+rows.filter(m=>m.clientId!==clientId&&m.id>(reads.get(clientId+':'+(m.deliveryMode||'direct'))?.lastReadId||0)).length+'건';
   const waiting=m=>m.clientId===clientId&&pending.some(p=>p.roomId===m.roomId&&p.requestId===m.requestId);
   const elements=rows.map(m=>bubble(m,waiting(m)));for(const p of pending.filter(p=>p.roomId===room&&!rows.some(m=>m.clientId===clientId&&m.requestId===p.requestId)))elements.push(bubble({clientId,sender:name,body:p.body,requestId:p.requestId},true));
   $('outbox').textContent=pending.filter(p=>p.roomId===room).map(p=>'ACK 확인 대기 · 재접속 시 같은 ID로 재전송 · '+p.requestId).join(' / ');
   $('messages').replaceChildren(...elements);$('messages').scrollTop=follow&&atBottom?$('messages').scrollHeight:top;requestAnimationFrame(markVisibleRead);
 }
-function bubble(m,waiting){const div=document.createElement('article');div.className='bubble'+(m.clientId===clientId?' mine':'')+(waiting?' pending':'');const small=document.createElement('small');small.textContent=m.sender+' · '+(waiting?(m.id?'#'+m.id+' · ACK 확인 대기':'서버 확인 대기'):'#'+m.id+' · '+new Date(m.createdAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}));const p=document.createElement('p');p.textContent=m.body;div.append(small,p);if(!waiting&&m.clientId===clientId){const receipt=document.createElement('span');receipt.className='read-state';receipt.textContent=[...reads.values()].some(r=>r.clientId!==clientId&&r.roomId===room&&r.lastReadId>=m.id)?'읽음':'안 읽음';div.append(receipt)}return div}
+function bubble(m,waiting){const div=document.createElement('article');div.className='bubble'+(m.clientId===clientId?' mine':'')+(waiting?' pending':'');const small=document.createElement('small');small.textContent=m.sender+' · '+(waiting?(m.id?'#'+m.id+' · ACK 확인 대기':'서버 확인 대기'):'#'+m.id+' · '+new Date(m.createdAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}));const p=document.createElement('p');p.textContent=m.body;div.append(small,p);if(!waiting&&m.clientId===clientId){const receipt=document.createElement('span');receipt.className='read-state';receipt.textContent=[...reads.values()].some(r=>r.clientId!==clientId&&r.roomId===room&&(r.deliveryMode||'direct')===(m.deliveryMode||'direct')&&r.lastReadId>=m.id)?'읽음':'안 읽음';div.append(receipt)}return div}
 function markVisibleRead(){
   if(document.hidden||!viewOpen||!joined||socket?.readyState!==WebSocket.OPEN)return;
   const area=$('messages');if(area.scrollHeight-area.scrollTop-area.clientHeight>24)return;
   const end=area.lastElementChild?.getBoundingClientRect();if(!end||end.bottom<=0||end.bottom>innerHeight+2)return;
-  const latest=Math.max(0,...[...messages.values()].filter(m=>m.clientId!==clientId&&m.roomId===room).map(m=>m.id));
-  if(latest<=Math.max(readRequested,reads.get(clientId)?.lastReadId||0))return;
-  readRequested=latest;socket.send(JSON.stringify({type:'read',upToId:latest}));
+  for(const mode of ['direct','kafka']){const latest=Math.max(0,...[...messages.values()].filter(m=>m.clientId!==clientId&&m.roomId===room&&(m.deliveryMode||'direct')===mode).map(m=>m.id));
+  if(latest<=Math.max(readRequested.get(mode)||0,reads.get(clientId+':'+mode)?.lastReadId||0))continue;
+  readRequested.set(mode,latest);socket.send(JSON.stringify({type:'read',upToId:latest}));}
 }
 function sendTyping(active){
   if(!active){clearTimeout(typingIdle);if(!typingSent)return}
@@ -41,7 +41,7 @@ function receiveTyping(event){
   renderTyping();
 }
 function inputTyping(){clearTimeout(typingIdle);if(!$('body').value.trim()){sendTyping(false);return}sendTyping(true);typingIdle=setTimeout(()=>sendTyping(false),2000)}
-function flush(){if(!joined||socket?.readyState!==WebSocket.OPEN)return;for(const p of pending.filter(p=>p.roomId===room))socket.send(JSON.stringify({type:'send',requestId:p.requestId,body:p.body}))}
+function flush(){if(!joined||socket?.readyState!==WebSocket.OPEN)return;for(const p of pending.filter(p=>p.roomId===room))socket.send(JSON.stringify({type:'send',requestId:p.requestId,body:p.body,mode:p.mode||'direct'}))}
 function receiveAck(event){
   messages.set(event.message.id,event.message);
   pending=pending.filter(p=>p.requestId!==event.requestId||p.roomId!==event.message.roomId);
@@ -53,15 +53,15 @@ function interruptBeforeAck(message){
   $('notice').textContent='서버 저장 #'+message.id+' 후 ACK 수신 전에 연결을 끊었습니다. 연결하기를 누르면 같은 requestId로 자동 재전송합니다.';
 }
 function connect(){
-  clearTimeout(retry);const version=++generation;joined=false;readRequested=0;status('연결 중…');
+  clearTimeout(retry);const version=++generation;joined=false;readRequested=new Map();status('연결 중…');
   const ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws/chat');socket=ws;
   ws.onopen=()=>{if(version!==generation)return;ws.send(JSON.stringify({type:'join',roomId:room,clientId,name}))};
   ws.onmessage=e=>{if(version!==generation)return;const event=JSON.parse(e.data);
-    if(event.type==='joined'){reads=new Map((event.reads||[]).map(r=>[r.clientId,r]));joined=true;attempt=0;for(const m of event.messages)messages.set(m.id,m);status('● 연결됨 · '+room);$('notice').textContent='연결되었습니다. 최근 대화를 불러왔습니다.';render();flush()}
+    if(event.type==='joined'){reads=new Map((event.reads||[]).map(r=>[r.clientId+':'+(r.deliveryMode||'direct'),r]));joined=true;attempt=0;for(const m of event.messages)messages.set(m.id,m);status('● 연결됨 · '+room);$('notice').textContent='연결되었습니다. 최근 대화를 불러왔습니다.';render();flush()}
     else if(event.type==='message'){messages.set(event.message.id,event.message);render();if(event.message.clientId===clientId&&event.message.requestId===cutRequest)interruptBeforeAck(event.message)}
-    else if(event.type==='ack')receiveAck(event);
+    else if(event.type==='ack'){if(event.requestId===cutRequest)interruptBeforeAck(event.message);else receiveAck(event)}
     else if(event.type==='typing')receiveTyping(event);
-    else if(event.type==='read'){if(event.receipt.roomId===room){const previous=reads.get(event.receipt.clientId);if(!previous||previous.lastReadId<event.receipt.lastReadId)reads.set(event.receipt.clientId,event.receipt);render(false)}}
+    else if(event.type==='read'){if(event.receipt.roomId===room){const key=event.receipt.clientId+':'+(event.receipt.deliveryMode||'direct'),previous=reads.get(key);if(!previous||previous.lastReadId<event.receipt.lastReadId)reads.set(key,event.receipt);render(false)}}
     else if(event.type==='presence')$('presence').textContent=event.names.join(', ')||'—';
     else if(event.type==='error'){$('notice').textContent=event.detail;wanted=false;joined=false;generation++;ws.close();status('입력값 확인 후 다시 연결하세요.')}
   };
@@ -70,8 +70,8 @@ function connect(){
 }
 function disconnect(){sendTyping(false);peerTyping.clear();renderTyping();wanted=false;joined=false;generation++;clearTimeout(retry);socket?.close();socket=null;status('연결 종료');$('presence').textContent='—'}
 $('connect').onclick=()=>{name=$('name').value.trim();if(!name||name.length>20){$('notice').textContent='이름은 1~20자입니다.';return}wanted=true;connect()};$('disconnect').onclick=disconnect;
-$('room').onchange=()=>{const again=wanted;disconnect();room=$('room').value;messages=new Map();reads=new Map();readRequested=0;$('room-name').textContent=$('room').selectedOptions[0].textContent;$('notice').textContent='';render();if(again){wanted=true;connect()}};
-$('compose').onsubmit=e=>{e.preventDefault();const body=$('body').value.trim();if(!joined||!body)return;sendTyping(false);const requestId=crypto.randomUUID();pending.push({roomId:room,requestId,body});if($('fault').checked){cutRequest=requestId;$('fault').checked=false}store();$('body').value='';render();flush()};
+$('room').onchange=()=>{const again=wanted;disconnect();room=$('room').value;messages=new Map();reads=new Map();readRequested=new Map();$('room-name').textContent=$('room').selectedOptions[0].textContent;$('notice').textContent='';render();if(again){wanted=true;connect()}};
+$('compose').onsubmit=e=>{e.preventDefault();const body=$('body').value.trim();if(!joined||!body)return;sendTyping(false);const requestId=crypto.randomUUID();pending.push({roomId:room,requestId,body,mode:$('mode').value});if($('fault').checked){cutRequest=requestId;$('fault').checked=false}store();$('body').value='';render();flush()};
 $('body').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('compose').requestSubmit()}};
 window.addEventListener('pagehide',()=>{clearTimeout(retry);socket?.close()});status('연결 전');render();
 
@@ -81,3 +81,13 @@ window.addEventListener('scroll',markVisibleRead,{passive:true});new Intersectio
 $('view-toggle').onclick=()=>{if(viewOpen)sendTyping(false);viewOpen=!viewOpen;$('view-toggle').textContent=viewOpen?'대화창 닫기':'대화창 열기';$('view-toggle').setAttribute('aria-expanded',String(viewOpen));$('conversation-view').hidden=!viewOpen;$('conversation-closed').hidden=viewOpen;if(viewOpen){$('messages').scrollTop=$('messages').scrollHeight;requestAnimationFrame(markVisibleRead)}};
 
 $('body').addEventListener('input',inputTyping);$('body').addEventListener('blur',()=>sendTyping(false));document.addEventListener('visibilitychange',()=>{if(document.hidden)sendTyping(false)});
+
+let deliveryState={enabled:false,running:false};
+async function refreshDelivery(){try{const response=await fetch('/api/demo/delivery');if(!response.ok)return;deliveryState=await response.json();
+  $('delivery-state').textContent=deliveryState.enabled?(deliveryState.running?'전달 서버 실행 중':'전달 서버 중단')+' · Outbox '+deliveryState.outboxPending+' · Kafka 대기 '+deliveryState.queued:'Kafka 비활성 · KAFKA_ENABLED=true와 브로커가 필요합니다.';
+  $('worker-toggle').disabled=!deliveryState.enabled||!deliveryState.controls;$('worker-toggle').textContent=deliveryState.running?'전달 서버 중단':'전달 서버 복구';
+  $('kafka-option').disabled=!deliveryState.enabled;
+}catch{}}
+$('worker-toggle').onclick=async()=>{await fetch('/api/demo/delivery',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({running:!deliveryState.running})});await refreshDelivery()};
+$('mode').onchange=()=>{$('notice').textContent=$('mode').value==='kafka'?'Kafka 경유 · 저장 ACK 후 비동기 전달':'현재 방식 · 저장 후 직접 방송'};
+setInterval(refreshDelivery,1000);refreshDelivery();

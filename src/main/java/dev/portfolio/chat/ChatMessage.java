@@ -8,6 +8,7 @@ public class ChatMessage {
     @Column(name = "room_id", nullable = false, length = 30) String roomId;
     @Column(name = "client_id", nullable = false, length = 80) String clientId;
     @Column(name = "request_id", nullable = false, length = 80) String requestId;
+    @Column(name="delivery_mode", nullable=false, length=10) String deliveryMode="direct";
     @Column(nullable = false, length = 20) String sender;
     @Column(nullable = false, length = 2000) String body;
     @Column(name = "created_at", nullable = false) Instant createdAt = Instant.now();
