@@ -16,10 +16,11 @@ class ChatSocketTest {
     @Autowired ObjectMapper json;
     @Autowired MessageRepository repository;
     class Peer implements WebSocket.Listener, AutoCloseable {
+        volatile boolean dropAfterMessage; final CompletableFuture<JsonNode> interrupted = new CompletableFuture<>();
         WebSocket socket; final BlockingQueue<JsonNode> events = new LinkedBlockingQueue<>(); final StringBuilder buffer = new StringBuilder();
         Peer() { socket = HttpClient.newHttpClient().newWebSocketBuilder().buildAsync(URI.create("ws://localhost:" + port + "/ws/chat"), this).join(); }
         @Override public void onOpen(WebSocket socket) { socket.request(1); }
-        @Override public CompletionStage<?> onText(WebSocket socket, CharSequence data, boolean last) { buffer.append(data); if(last){try{events.add(json.readTree(buffer.toString()));}catch(Exception e){throw new RuntimeException(e);}buffer.setLength(0);}socket.request(1);return null; }
+        @Override public CompletionStage<?> onText(WebSocket socket, CharSequence data, boolean last) { buffer.append(data); if(last){try{var event=json.readTree(buffer.toString());if(dropAfterMessage&&event.path("type").asText().equals("message")){socket.abort();interrupted.complete(event);return null;}events.add(event);}catch(Exception e){throw new RuntimeException(e);}buffer.setLength(0);}socket.request(1);return null; }
         void raw(String text) { socket.sendText(text, true).join(); }
         void send(Object data) throws Exception { raw(json.writeValueAsString(data)); }
         JsonNode await(String type) throws Exception { long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);while(System.nanoTime()<until){var e=events.poll(100,TimeUnit.MILLISECONDS);if(e!=null&&e.path("type").asText().equals(type))return e;}throw new AssertionError("No event: "+type); }
@@ -40,6 +41,32 @@ class ChatSocketTest {
         try(var reconnect=new Peer()){
             var history=reconnect.join("lobby",client).get("messages");assertThat(history.findValuesAsText("id")).contains(String.valueOf(id));
             reconnect.send(Map.of("type","send","requestId",request,"body","재전송"));assertThat(reconnect.await("ack").get("message").get("id").asLong()).isEqualTo(id);
+        }
+    }
+    @Test void connectionLostBeforeAckRetriesOriginalRequestWithoutAnotherInsertOrBroadcast() throws Exception {
+        String client="lost"+System.nanoTime(),request=UUID.randomUUID().toString();
+        var frame=Map.of("type","send","requestId",request,"body","ACK 수신 전 연결 끊김");
+        long before=repository.count();
+        try(var b=new Peer()){
+            b.join("design","peer"+System.nanoTime());long id;
+            try(var a=new Peer()){
+                a.join("design",client);a.dropAfterMessage=true;a.send(frame);
+                id=a.interrupted.get(5,TimeUnit.SECONDS).path("message").path("id").asLong();
+                assertThat(a.events.stream().noneMatch(e->e.path("type").asText().equals("ack"))).isTrue();
+                assertThat(b.await("message").path("message").path("id").asLong()).isEqualTo(id);
+            }
+            assertThat(repository.count()).isEqualTo(before+1);
+            try(var reconnect=new Peer()){
+                var history=reconnect.join("design",client).path("messages");
+                assertThat(history.findValuesAsText("requestId").stream().filter(request::equals).count()).isEqualTo(1);
+                reconnect.send(frame);var ack=reconnect.await("ack");
+                assertThat(ack.path("duplicate").asBoolean()).isTrue();
+                assertThat(ack.path("requestId").asText()).isEqualTo(request);
+                assertThat(ack.path("message").path("id").asLong()).isEqualTo(id);
+                assertThat(repository.count()).isEqualTo(before+1);
+                assertThat(b.getsMessage()).isFalse();
+                assertThat(reconnect.getsMessage()).isFalse();
+            }
         }
     }
     @Test void invalidInputNeverWritesAndConnectionStaysUsable() throws Exception {

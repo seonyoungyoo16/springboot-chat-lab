@@ -5,3 +5,5 @@
 .conversation-closed{min-height:380px;padding:36px 20px;text-align:center;align-content:center}.conversation-closed>span{color:#ffbd8f;font-size:14px}.room-head{flex-wrap:wrap}[hidden]{display:none!important}
 
 .typing-status{min-height:22px;margin:4px 0;font-size:13px;color:#9edabb}
+
+.fault-control{display:flex;gap:8px;align-items:center;font-size:13px;color:#ffc391;margin-top:12px}.fault-control input{width:16px;height:16px;accent-color:#ff984f}.outbox{font-size:12px;overflow-wrap:anywhere;color:#ffc391;margin:8px 0}.outbox:empty{display:none}
