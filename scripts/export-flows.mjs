@@ -23,7 +23,7 @@ const kafkaUnavailable=[...kafkaSend.slice(0,5),step('Kafka 연결 불가 · 발
 const kafkaUnavailableInterrupted=kafkaUnavailable.map((item,index)=>index===4?interrupted.at(-1):item)
 const kafkaPublish=kafkaSend.slice(5)
 const kafkaInterrupted=kafkaSend.map((item,index)=>index===4?interrupted.at(-1):item)
-const kafkaDeliver=[step('Kafka Consumer · 보관된 이벤트 수신',delivery,'public void consume(ConsumerRecord','consumer'),step('처리한 이벤트 ID인지 확인',delivery,'SELECT COUNT(*) FROM chat_deliveries','consumer'),step('같은 방 참가자에게 WebSocket 전달',socket,'public synchronized void deliver(KafkaDelivery.Ready','recipient'),step('처리한 이벤트 기록 · DB commit',delivery,'INSERT INTO chat_deliveries','consumer'),step('Consumer 처리 완료 · offset commit',delivery,'Container commits its Kafka offset','offset')]
+const kafkaDeliver=[step('Kafka Consumer · 보관된 이벤트 수신',delivery,'public void consume(ConsumerRecord','consumer'),step('처리한 이벤트 ID인지 확인',delivery,'SELECT COUNT(*) FROM chat_deliveries','consumer'),step('처리한 이벤트 기록 · DB commit',delivery,'INSERT INTO chat_deliveries','database'),step('DB commit 후 같은 방에 WebSocket 전달',socket,'public synchronized void deliver(KafkaDelivery.Ready','recipient'),step('Consumer 처리 완료 · offset commit',delivery,'Container commits its Kafka offset','offset')]
 const databaseUnavailable=[send[0],step('DB 접근 실패 · 저장하지 못함',availability,'if (!running) throw','database-unavailable'),step('실패 응답 · ACK와 상대 전달 없음',socket,'"code", "DB_UNAVAILABLE"','server'),step('PC에서 원래 요청 보관 · 복구 대기',client,'Keep the joined socket open','sender')]
 const databaseRetry=send.map((item,index)=>index===0?step('원래 요청 ID로 재전송',client,"requestId:p.requestId,body:p.body",'sender'):item)
 const databaseRetryKafka=kafkaSend.map((item,index)=>index===0?databaseRetry[0]:item)
