@@ -112,6 +112,7 @@ async function refreshDelivery(){try{const response=await fetch('/api/demo/deliv
   $('database-toggle').disabled=!deliveryState.controls;$('database-toggle').textContent=databaseBlocked?'DB 복구':'DB 중단';
   $('database-state').textContent=databaseBlocked?'DB 중단 · 저장/조회 불가 · PC에서 전송 대기':'DB 정상 · 저장 가능';
   if(wasBlocked&&!databaseBlocked){readRequested=new Map();flush();render();requestAnimationFrame(markVisibleRead)}
+  if(wasBlocked!==databaseBlocked)render(false);
   $('broker-toggle').disabled=!deliveryState.enabled||!deliveryState.controls;$('broker-toggle').textContent=deliveryState.brokerRunning===false?'Kafka 복구':'Kafka 중단';
   $('delivery-state').textContent=deliveryState.enabled?(deliveryState.brokerRunning===false?'Kafka 중단 · ':'Kafka 연결 허용 · ')+(deliveryState.running?'전달 서버 실행 중':'전달 서버 중단')+(deliveryState.metricsStale?' · DB 지표는 마지막 확인값':'')+' · Outbox '+deliveryState.outboxPending+' · Kafka 대기 '+deliveryState.queued+(deliveryState.publishError?' · 발행 보류: '+deliveryState.publishError:''):'Kafka 비활성 · KAFKA_ENABLED=true와 브로커가 필요합니다.';
   $('worker-toggle').disabled=!deliveryState.enabled||!deliveryState.controls;$('worker-toggle').textContent=deliveryState.running?'전달 서버 중단':'전달 서버 복구';
