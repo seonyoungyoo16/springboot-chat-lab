@@ -111,3 +111,12 @@ Kafka 중단과 전달 서버 중단을 독립적으로 선택합니다. `PUT /a
 저장 트랜잭션 실패 시 WebSocket은 `error / DB_UNAVAILABLE / retryable:true / requestId`를 돌려줍니다. 저장 ACK와 상대 전달은 하지 않습니다. 브라우저는 원래 요청 ID·본문·방·전송 방식을 sessionStorage에 보관하고, DB 복구를 확인하면 같은 요청을 자동 전송합니다. 이미 저장된 요청은 `(client_id, request_id)` 조회로 기존 메시지 ACK만 반환합니다. Kafka에서는 메시지와 Outbox가 함께 commit된 후 발행됩니다. Consumer의 DB 트랜잭션 실패는 offset을 commit하지 않고 재시도하며, 상대 전달은 DB commit 후에만 발생합니다.
 
 `KafkaDeliveryTest`는 두 전송 방식의 중단/복구/중복 재시도와 실제 H2 Outbox INSERT 예외를 검증합니다. INSERT 예외 시 먼저 실행된 메시지 INSERT도 rollback되고, 재시도 시 메시지와 Outbox가 한 건만 남는지 확인합니다. Pages 화면은 이 동작을 재현하는 브라우저 시뮬레이션입니다.
+
+
+### 여러 전송 대기 요청의 순차 복구
+
+DB 중단 중에도 여러 메시지를 입력할 수 있습니다. PC 대기열은 본문·방·mode·원래 requestId를 배열 순서로 sessionStorage에 보관합니다. DB 복구 또는 소켓 재접속 후 현재 방의 맨 앞 요청 한 건만 전송하고, 해당 요청의 ACK를 확인한 뒤 다음 요청을 전송합니다. 방송이나 기록 조회, 다른 요청의 ACK로 대기열을 넘기지 않습니다. 재실패/연결 끊김 시 미확인 요청을 맨 앞에 유지합니다. 이미 commit된 요청의 재시도는 기존 ID의 ACK만 반환합니다.
+
+현재 방식은 저장 후 순서대로 직접 방송하고, Kafka 방식은 방별 같은 파티션에 순서대로 발행해 전달합니다. Kafka 경유 요청의 저장 ACK와 Consumer 전달은 별도이며 전달 서버 중단 시 저장 ACK 후 Kafka에 대기합니다. 서로 다른 방/전송 경로의 전역 도착 순서를 보장하는 분산 시스템은 아닙니다.
+
+`node scripts/test-client-queue.mjs`는 실제 클라이언트에서 사용하는 단일 전송 상태 모듈을 검사합니다. 통합 테스트는 두 전송 방식에서 여러 원래 요청 ID, 두 번째 DB 장애, commit된 요청 재시도, 저장 및 수신 순서와 중복 방지를 확인합니다.

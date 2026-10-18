@@ -155,6 +155,36 @@ class KafkaDeliveryTest {
             }
         }finally{control(Map.of("databaseRunning",true));}
     }
+    @Test void multiplePendingRequestsRecoverInOrderAcrossRepeatedFailureAndDuplicateHead()throws Exception{
+        for(String mode:List.of("direct","kafka")){
+            String client="fifo-"+mode;
+            try(var a=new Peer(client,"design");var b=new Peer(client+"-b","design")){
+                if(mode.equals("kafka")){delivery.setRunning(false);await().atMost(Duration.ofSeconds(10)).until(()->Boolean.TRUE.equals(delivery.state().get("paused")));}
+                var requests=new ArrayList<Map<String,String>>();
+                for(int n=1;n<=4;n++)requests.add(Map.of("type","send","mode",mode,"requestId",client+"-original-"+n,"body","순서 "+n));
+                control(Map.of("databaseRunning",false));
+                for(var request:requests){a.send(request);assertThat(a.take("error").path("requestId").asText()).isEqualTo(request.get("requestId"));}
+                assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM chat_messages WHERE client_id=?",Long.class,client)).isZero();
+                assertThat(b.messageWithin300ms()).isFalse();control(Map.of("databaseRunning",true));
+                var ids=new ArrayList<Long>();
+                for(int n=0;n<requests.size();n++){
+                    if(n==1){ // A second outage must keep this request at the head.
+                        control(Map.of("databaseRunning",false));a.send(requests.get(n));assertThat(a.take("error").path("code").asText()).isEqualTo("DB_UNAVAILABLE");control(Map.of("databaseRunning",true));
+                    }
+                    var request=requests.get(n);a.send(request);var ack=a.take("ack");ids.add(ack.path("message").path("id").asLong());
+                    assertThat(ack.path("message").path("requestId").asText()).isEqualTo(request.get("requestId"));assertThat(ack.path("duplicate").asBoolean()).isFalse();
+                    // Replay a committed head after an ACK-loss scenario; no second INSERT or broadcast.
+                    a.send(request);assertThat(a.take("ack").path("duplicate").asBoolean()).isTrue();
+                }
+                if(mode.equals("kafka"))delivery.setRunning(true);
+                var received=new ArrayList<Long>();for(int n=0;n<4;n++)received.add(b.take("message").path("message").path("id").asLong());
+                assertThat(received).containsExactlyElementsOf(ids);assertThat(b.messageWithin300ms()).isFalse();
+                var stored=jdbc.queryForList("SELECT request_id FROM chat_messages WHERE client_id=? ORDER BY id",String.class,client);
+                assertThat(stored).containsExactlyElementsOf(requests.stream().map(r->r.get("requestId")).toList());
+                if(mode.equals("kafka"))await().atMost(Duration.ofSeconds(10)).until(()->jdbc.queryForObject("SELECT COUNT(*) FROM chat_deliveries WHERE message_id IN (SELECT id FROM chat_messages WHERE client_id=?)",Long.class,client)==4L);
+            }finally{control(Map.of("databaseRunning",true));delivery.setRunning(true);}
+        }
+    }
     public static class FailOutboxOnce implements org.h2.api.Trigger {
         static final java.util.concurrent.atomic.AtomicBoolean fail=new java.util.concurrent.atomic.AtomicBoolean();
         @Override public void fire(java.sql.Connection connection,Object[] oldRow,Object[] newRow)throws java.sql.SQLException{

@@ -1,3 +1,5 @@
+import {ChatSendQueue} from './chat-queue.js';
+const sendQueue=new ChatSendQueue();
 const $=id=>document.getElementById(id);
 const clientId=sessionStorage.getItem('chat-client')||crypto.randomUUID();sessionStorage.setItem('chat-client',clientId);
 let socket=null,wanted=false,joined=false,retry=null,attempt=0,generation=0,room='lobby',name='참가자',viewOpen=true;
@@ -13,7 +15,15 @@ function render(follow=true){
   $('closed-count').textContent='받은 메시지 '+rows.length+'건 · 안 읽은 메시지 '+rows.filter(m=>m.clientId!==clientId&&m.id>(reads.get(clientId+':'+(m.deliveryMode||'direct'))?.lastReadId||0)).length+'건';
   const waiting=m=>m.clientId===clientId&&pending.some(p=>p.roomId===m.roomId&&p.requestId===m.requestId);
   const elements=rows.map(m=>bubble(m,waiting(m)));for(const p of pending.filter(p=>p.roomId===room&&!rows.some(m=>m.clientId===clientId&&m.requestId===p.requestId)))elements.push(bubble({clientId,sender:name,body:p.body,requestId:p.requestId},true));
-  $('outbox').textContent=pending.filter(p=>p.roomId===room).map(p=>(databaseBlocked?'DB 저장 실패 · 전송 대기 · 복구 후 같은 ID로 재전송 · ':'ACK 확인 대기 · 재접속 시 같은 ID로 재전송 · ')+p.requestId).join(' / ');
+  const queued=pending.filter(p=>p.roomId===room),list=document.createElement('ol');
+  for(const [index,p] of queued.entries()){
+    const row=document.createElement('li'),title=document.createElement('strong'),body=document.createElement('p'),id=document.createElement('code');
+    const active=sendQueue.inFlight?.requestId===p.requestId;
+    row.dataset.requestId=p.requestId;row.dataset.queueState=active?'sending':'waiting';
+    title.textContent=(index+1)+'. '+(active?'전송 중 · ACK 확인 대기':databaseBlocked?'DB 복구 대기':'순서 대기');body.textContent=p.body;id.textContent=p.requestId;
+    row.append(title,body,id);list.append(row);
+  }
+  $('outbox').replaceChildren();if(queued.length){const heading=document.createElement('strong');heading.textContent='전송 대기 '+queued.length+'건 · ACK 후 다음 요청';$('outbox').append(heading,list)}
   $('messages').replaceChildren(...elements);$('messages').scrollTop=follow&&atBottom?$('messages').scrollHeight:top;requestAnimationFrame(markVisibleRead);
 }
 function bubble(m,waiting){const div=document.createElement('article');div.className='bubble'+(m.clientId===clientId?' mine':'')+(waiting?' pending':'');const small=document.createElement('small');small.textContent=m.sender+' · '+(waiting?(m.id?'#'+m.id+' · ACK 확인 대기':'서버 확인 대기'):'#'+m.id+' · '+new Date(m.createdAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}));const p=document.createElement('p');p.textContent=m.body;div.append(small,p);if(!waiting&&m.clientId===clientId){const receipt=document.createElement('span');receipt.className='read-state';receipt.textContent=[...reads.values()].some(r=>r.clientId!==clientId&&r.roomId===room&&(r.deliveryMode||'direct')===(m.deliveryMode||'direct')&&r.lastReadId>=m.id)?'읽음':'안 읽음';div.append(receipt)}return div}
@@ -42,11 +52,17 @@ function receiveTyping(event){
   renderTyping();
 }
 function inputTyping(){clearTimeout(typingIdle);if(!$('body').value.trim()){sendTyping(false);return}sendTyping(true);typingIdle=setTimeout(()=>sendTyping(false),2000)}
-function flush(){if(databaseBlocked||!joined||socket?.readyState!==WebSocket.OPEN)return;for(const p of pending.filter(p=>p.roomId===room))socket.send(JSON.stringify({type:'send',requestId:p.requestId,body:p.body,mode:p.mode||'direct'}))}
+function flush(){
+  if(databaseBlocked||!joined||socket?.readyState!==WebSocket.OPEN)return;
+  const p=sendQueue.next(pending,room);if(!p)return;
+  try{socket.send(JSON.stringify({type:'send',requestId:p.requestId,body:p.body,mode:p.mode||'direct'}));render(false)}catch{sendQueue.reset();socket?.close();}
+}
 function receiveAck(event){
+  if(event.requestId!==event.message.requestId)return;
+  const remaining=sendQueue.acknowledge(pending,event.message);if(remaining===pending)return;
   messages.set(event.message.id,event.message);
-  pending=pending.filter(p=>p.requestId!==event.requestId||p.roomId!==event.message.roomId);
-  store();render();$('notice').textContent=event.duplicate?'재전송 ACK · 기존 메시지 #'+event.message.id+' · 추가 저장/방송 없음 · '+event.requestId:'서버 저장 확인 · #'+event.message.id;
+  pending=remaining; // Matching ACK removes only this request; preserve the tail in original order.
+  store();render();flush();$('notice').textContent=event.duplicate?'재전송 ACK · 기존 메시지 #'+event.message.id+' · 추가 저장/방송 없음 · '+event.requestId:'서버 저장 확인 · #'+event.message.id;
 }
 function interruptBeforeAck(message){
   // Deterministic demo: receive the committed broadcast, then ignore queued ACKs from this socket.
@@ -54,7 +70,7 @@ function interruptBeforeAck(message){
   $('notice').textContent='서버 저장 #'+message.id+' 후 ACK 수신 전에 연결을 끊었습니다. 연결하기를 누르면 같은 requestId로 자동 재전송합니다.';
 }
 function connect(){
-  clearTimeout(retry);const version=++generation;joined=false;readRequested=new Map();status('연결 중…');
+  clearTimeout(retry);sendQueue.reset();const version=++generation;joined=false;readRequested=new Map();status('연결 중…');
   const ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws/chat');socket=ws;
   ws.onopen=()=>{if(version!==generation)return;ws.send(JSON.stringify({type:'join',roomId:room,clientId,name}))};
   ws.onmessage=e=>{if(version!==generation)return;const event=JSON.parse(e.data);
@@ -66,20 +82,20 @@ function connect(){
     else if(event.type==='presence')$('presence').textContent=event.names.join(', ')||'—';
     else if(event.type==='error'){
       if(event.code==='DB_UNAVAILABLE'&&event.retryable){
-        databaseBlocked=true;readRequested=new Map();render();
+        databaseBlocked=true;sendQueue.reset();readRequested=new Map();render();
         $('notice').textContent='DB 처리 실패 · ACK 없음 · 전송 대기 유지 · '+event.requestId;
         // Keep the joined socket open; retry this exact request only after DB recovery.
         if(event.operation==='join'){ws.close();}
       }else{$('notice').textContent=event.detail;wanted=false;joined=false;generation++;ws.close();status('입력값 확인 후 다시 연결하세요.')}
     }
   };
-  ws.onclose=()=>{if(version!==generation)return;joined=false;typingSent=false;clearTimeout(typingIdle);peerTyping.clear();renderTyping();$('presence').textContent='—';if(wanted){const delay=Math.min(10000,1000*2**attempt++);status('연결 끊김 · '+delay/1000+'초 후 재접속');retry=setTimeout(connect,delay)}else status('연결 종료')};
+  ws.onclose=()=>{if(version!==generation)return;joined=false;sendQueue.reset();typingSent=false;clearTimeout(typingIdle);peerTyping.clear();renderTyping();$('presence').textContent='—';if(wanted){const delay=Math.min(10000,1000*2**attempt++);status('연결 끊김 · '+delay/1000+'초 후 재접속');retry=setTimeout(connect,delay)}else status('연결 종료')};
   ws.onerror=()=>{if(version===generation)$('notice').textContent='연결을 확인하고 있습니다.'};
 }
-function disconnect(){sendTyping(false);peerTyping.clear();renderTyping();wanted=false;joined=false;generation++;clearTimeout(retry);socket?.close();socket=null;status('연결 종료');$('presence').textContent='—'}
+function disconnect(){sendTyping(false);sendQueue.reset();peerTyping.clear();renderTyping();wanted=false;joined=false;generation++;clearTimeout(retry);socket?.close();socket=null;status('연결 종료');$('presence').textContent='—'}
 $('connect').onclick=()=>{name=$('name').value.trim();if(!name||name.length>20){$('notice').textContent='이름은 1~20자입니다.';return}wanted=true;connect()};$('disconnect').onclick=disconnect;
 $('room').onchange=()=>{const again=wanted;disconnect();room=$('room').value;messages=new Map();reads=new Map();readRequested=new Map();$('room-name').textContent=$('room').selectedOptions[0].textContent;$('notice').textContent='';render();if(again){wanted=true;connect()}};
-$('compose').onsubmit=e=>{e.preventDefault();const body=$('body').value.trim();if(!joined||!body)return;sendTyping(false);const requestId=crypto.randomUUID();pending.push({roomId:room,requestId,body,mode:$('mode').value});if($('fault').checked){cutRequest=requestId;$('fault').checked=false}store();$('body').value='';render();if(databaseBlocked){socket.send(JSON.stringify({type:'send',requestId,body,mode:$('mode').value}))}else flush()};
+$('compose').onsubmit=e=>{e.preventDefault();const body=$('body').value.trim();if(!joined||!body)return;sendTyping(false);const requestId=crypto.randomUUID();pending.push({roomId:room,requestId,body,mode:$('mode').value});if($('fault').checked){cutRequest=requestId;$('fault').checked=false}store();$('body').value='';render();flush()};
 $('body').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('compose').requestSubmit()}};
 window.addEventListener('pagehide',()=>{clearTimeout(retry);socket?.close()});status('연결 전');render();
 
