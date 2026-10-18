@@ -51,3 +51,23 @@ for(const mode of ['direct','kafka']){
   assert.equal(queue.canCancel({roomId:'lobby',requestId:'legacy-unknown'}),false)
 }
 console.log('Cancellation: middle/head/all requests, confirmed failure, original survivor order, durable exclusion, in-flight/ACK-loss and legacy guards passed.')
+
+for(const mode of ['direct','kafka']){
+  const queue=new ChatSendQueue();let pending=[1,2,3].map(n=>({roomId:'lobby',requestId:mode+'-resend-'+n,body:'message '+n,mode,cancelable:true}))
+  const canceled=pending[1];pending=queue.cancel(pending,'lobby',canceled.requestId)
+  const active=queue.next(pending,'lobby'),before=structuredClone(pending)
+  const restored=queue.requeue(pending,{...canceled,cut:true},mode+'-fresh-4')
+  assert.deepEqual(pending,before);assert.deepEqual(restored.pending.map(p=>p.requestId),[before[0].requestId,before[1].requestId,mode+'-fresh-4'])
+  assert.equal(queue.inFlight.requestId,active.requestId);assert.equal(queue.next(restored.pending,'lobby'),null)
+  assert.equal(restored.request.body,canceled.body);assert.equal(restored.request.roomId,canceled.roomId);assert.equal(restored.request.mode,mode)
+  assert.equal(restored.request.requeuedFrom,canceled.requestId);assert.equal(restored.request.cancelable,true);assert.equal(restored.request.cut,undefined)
+  assert.throws(()=>queue.requeue(restored.pending,canceled,mode+'-duplicate-5'))
+  for(const bad of [canceled.requestId,pending[0].requestId,'invalid id',undefined])assert.throws(()=>queue.requeue(pending,canceled,bad))
+  canceled.requeuedAs=restored.request.requestId;assert.throws(()=>queue.requeue([],canceled,mode+'-again-5'))
+  pending=JSON.parse(JSON.stringify(restored.pending));queue.reset();const sent=[]
+  while(pending.length){const request=queue.next(pending,'lobby');sent.push(request.requestId);pending=queue.acknowledge(pending,request)}
+  assert.deepEqual(sent,[before[0].requestId,before[1].requestId,mode+'-fresh-4']);assert.ok(!sent.includes(canceled.requestId))
+  // A requeued request can itself be canceled and requeued as a distinct new request.
+  const second=queue.requeue([],restored.request,mode+'-fresh-6');assert.equal(second.request.requeuedFrom,restored.request.requestId)
+}
+console.log('Requeue canceled: fresh ID, append-only order, original payload/mode, single use, active-send isolation, reload, ID collision guards and repeated cancellation passed.')

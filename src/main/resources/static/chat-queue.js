@@ -17,6 +17,12 @@ export class ChatSendQueue {
     if (!request || !this.canCancel(request)) return pending;
     return pending.filter(p => p !== request); // Cancellation preserves the original order of the survivors.
   }
+  requeue(pending, canceled, newRequestId) {
+    if (canceled.requeuedAs || pending.some(p => p.roomId === canceled.roomId && p.requeuedFrom === canceled.requestId)) throw new Error('이미 대기열에 다시 추가한 요청입니다.');
+    if (typeof newRequestId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(newRequestId) || newRequestId === canceled.requestId || pending.some(p => p.requestId === newRequestId)) throw new Error('새 요청 ID가 필요합니다.');
+    const request = {roomId:canceled.roomId, requestId:newRequestId, body:canceled.body, mode:canceled.mode || 'direct', cancelable:true, requeuedFrom:canceled.requestId};
+    return {pending:[...pending,request],request}; // Append a fresh request at the tail; never restore the old position.
+  }
   failed(pending, requestId) {
     if (this.inFlight?.requestId !== requestId) return;
     const request = pending.find(p => p.roomId === this.inFlight.roomId && p.requestId === requestId);
