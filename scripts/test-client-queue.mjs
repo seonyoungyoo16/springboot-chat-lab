@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import {ChatSendQueue} from '../src/main/resources/static/chat-queue.js'
 
 for(const mode of ['direct','kafka']){
-  let pending=[1,2,3].map(n=>({roomId:'lobby',requestId:mode+'-original-'+n,body:'message '+n,mode}))
-  const original=structuredClone(pending),queue=new ChatSendQueue(),sent=[]
+  let pending=[1,2,3].map(n=>({roomId:'lobby',requestId:mode+'-original-'+n,body:'message '+n,mode,cancelable:true}))
+  const original=structuredClone(pending);original[0].cancelable=false;const queue=new ChatSendQueue(),sent=[]
   const first=queue.next(pending,'lobby');sent.push(first.requestId)
   // Adding more requests, a broadcast or an unrelated ACK cannot send the tail.
   pending.push({roomId:'lobby',requestId:mode+'-original-4',body:'message 4',mode})
@@ -26,3 +26,28 @@ for(const mode of ['direct','kafka']){
 const rooms=new ChatSendQueue(),pending=[{roomId:'design',requestId:'other-room'},{roomId:'lobby',requestId:'current-room'}]
 assert.equal(rooms.next(pending,'lobby').requestId,'current-room')
 console.log('Client FIFO: single flight, matching ACK only, enqueue during send, original IDs/modes, failure/reload and room isolation passed.')
+
+for(const mode of ['direct','kafka']){
+  const queue=new ChatSendQueue();let pending=[1,2,3,4].map(n=>({roomId:'lobby',requestId:mode+'-cancel-'+n,body:'message '+n,mode,cancelable:true}))
+  const cancelled=pending[1].requestId;
+  // Cancel while DB is down, persist survivors, and retain the exact remaining send order.
+  pending=queue.cancel(pending,'lobby',cancelled);pending=JSON.parse(JSON.stringify(pending))
+  assert.deepEqual(pending.map(p=>p.body),['message 1','message 3','message 4'])
+  assert.equal(queue.cancel(pending,'lobby',cancelled),pending)
+  assert.equal(queue.cancel(pending,'design',pending[0].requestId),pending)
+  const sent=[];let head=queue.next(pending,'lobby');sent.push(head.requestId)
+  assert.equal(queue.canCancel(head),false);assert.equal(queue.cancel(pending,'lobby',head.requestId),pending)
+  queue.reset();pending=JSON.parse(JSON.stringify(pending))
+  assert.equal(queue.canCancel(pending[0]),false) // ACK may be lost; reload does not authorize cancellation.
+  head=queue.next(pending,'lobby');pending=queue.acknowledge(pending,head)
+  while(pending.length){head=queue.next(pending,'lobby');sent.push(head.requestId);pending=queue.acknowledge(pending,head)}
+  assert.deepEqual(sent,[1,3,4].map(n=>mode+'-cancel-'+n));assert.ok(!sent.includes(cancelled))
+}
+{
+  const queue=new ChatSendQueue();let pending=[{roomId:'lobby',requestId:'confirmed-failure',body:'failure',cancelable:true}]
+  queue.next(pending,'lobby');queue.failed(pending,'unrelated');assert.equal(queue.canCancel(pending[0]),false)
+  queue.failed(pending,'confirmed-failure');assert.equal(queue.canCancel(pending[0]),true)
+  pending=queue.cancel(pending,'lobby','confirmed-failure');assert.equal(queue.next(pending,'lobby'),null)
+  assert.equal(queue.canCancel({roomId:'lobby',requestId:'legacy-unknown'}),false)
+}
+console.log('Cancellation: middle/head/all requests, confirmed failure, original survivor order, durable exclusion, in-flight/ACK-loss and legacy guards passed.')

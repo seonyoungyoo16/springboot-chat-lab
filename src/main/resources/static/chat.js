@@ -5,9 +5,9 @@ const clientId=sessionStorage.getItem('chat-client')||crypto.randomUUID();sessio
 let socket=null,wanted=false,joined=false,retry=null,attempt=0,generation=0,room='lobby',name='참가자',viewOpen=true;
 let messages=new Map(),pending=[],reads=new Map(),readRequested=new Map(),cutRequest=null;
 try{pending=JSON.parse(sessionStorage.getItem('chat-pending')||'[]')}catch{}
-let databaseBlocked=false;
+let databaseBlocked=false;const cancellations=[];
 let typingSent=false,lastTypingAt=0,typingIdle=null;const peerTyping=new Map();
-const store=()=>{try{sessionStorage.setItem('chat-pending',JSON.stringify(pending))}catch{}};
+const store=(items=pending)=>{try{sessionStorage.setItem('chat-pending',JSON.stringify(items));return true}catch{$('notice').textContent='대기 상태를 저장하지 못해 전송·취소를 보류합니다.';return false}};
 function status(text){$('status').textContent=text;$('body').disabled=!joined;$('send').disabled=!joined;$('fault').disabled=!joined;$('connect').disabled=wanted;$('disconnect').disabled=!wanted;$('name').disabled=wanted;$('closed-state').textContent=joined?'온라인 · 메시지 수신 중':'오프라인 · 서버에 대화 보관 중'}
 function render(follow=true){
   const top=$('messages').scrollTop,atBottom=$('messages').scrollHeight-top-$('messages').clientHeight<24;
@@ -21,9 +21,15 @@ function render(follow=true){
     const active=sendQueue.inFlight?.requestId===p.requestId;
     row.dataset.requestId=p.requestId;row.dataset.queueState=active?'sending':'waiting';
     title.textContent=(index+1)+'. '+(active?'전송 중 · ACK 확인 대기':databaseBlocked?'DB 복구 대기':'순서 대기');body.textContent=p.body;id.textContent=p.requestId;
-    row.append(title,body,id);list.append(row);
+    const cancel=document.createElement('button');cancel.type='button';cancel.className='text-action cancel-action';
+    cancel.textContent=sendQueue.canCancel(p)?'취소':'전송 결과 확인 중';cancel.setAttribute('aria-label','대기 메시지 '+(index+1)+' 취소');cancel.disabled=!sendQueue.canCancel(p);cancel.onclick=()=>cancelPending(p.roomId,p.requestId);
+    row.append(title,body,id,cancel);list.append(row);
   }
   $('outbox').replaceChildren();if(queued.length){const heading=document.createElement('strong');heading.textContent='전송 대기 '+queued.length+'건 · ACK 후 다음 요청';$('outbox').append(heading,list)}
+  const cancelledList=document.createElement('ol');for(const p of cancellations.filter(p=>p.roomId===room)){
+    const row=document.createElement('li'),body=document.createElement('p'),id=document.createElement('code');body.textContent='취소됨 · '+p.body;id.textContent=p.requestId;row.append(body,id);cancelledList.append(row);
+  }
+  $('cancelled').replaceChildren();if(cancelledList.children.length){const title=document.createElement('strong');title.textContent='취소한 요청 '+cancelledList.children.length+'건 · 재전송 제외';$('cancelled').append(title,cancelledList)}
   $('messages').replaceChildren(...elements);$('messages').scrollTop=follow&&atBottom?$('messages').scrollHeight:top;requestAnimationFrame(markVisibleRead);
 }
 function bubble(m,waiting){const div=document.createElement('article');div.className='bubble'+(m.clientId===clientId?' mine':'')+(waiting?' pending':'');const small=document.createElement('small');small.textContent=m.sender+' · '+(waiting?(m.id?'#'+m.id+' · ACK 확인 대기':'서버 확인 대기'):'#'+m.id+' · '+new Date(m.createdAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}));const p=document.createElement('p');p.textContent=m.body;div.append(small,p);if(!waiting&&m.clientId===clientId){const receipt=document.createElement('span');receipt.className='read-state';receipt.textContent=[...reads.values()].some(r=>r.clientId!==clientId&&r.roomId===room&&(r.deliveryMode||'direct')===(m.deliveryMode||'direct')&&r.lastReadId>=m.id)?'읽음':'안 읽음';div.append(receipt)}return div}
@@ -52,9 +58,17 @@ function receiveTyping(event){
   renderTyping();
 }
 function inputTyping(){clearTimeout(typingIdle);if(!$('body').value.trim()){sendTyping(false);return}sendTyping(true);typingIdle=setTimeout(()=>sendTyping(false),2000)}
+function cancelPending(roomId,requestId){
+  const request=pending.find(p=>p.roomId===roomId&&p.requestId===requestId),remaining=sendQueue.cancel(pending,roomId,requestId);
+  if(remaining===pending||!store(remaining))return;
+  pending=remaining; // Cancel before transport; this request is never sent to the server.
+  cancellations.push(request);if(cancellations.length>20)cancellations.shift();if(cutRequest===requestId)cutRequest=null;
+  render(false);$('notice').textContent='전송 대기 취소 · '+requestId+' · 나머지는 원래 순서대로 처리합니다.';flush();
+}
 function flush(){
   if(databaseBlocked||!joined||socket?.readyState!==WebSocket.OPEN)return;
   const p=sendQueue.next(pending,room);if(!p)return;
+  if(!store()){sendQueue.reset();return;} // Persist non-cancelable state before the first network write.
   try{socket.send(JSON.stringify({type:'send',requestId:p.requestId,body:p.body,mode:p.mode||'direct'}));render(false)}catch{sendQueue.reset();socket?.close();}
 }
 function receiveAck(event){
@@ -82,7 +96,7 @@ function connect(){
     else if(event.type==='presence')$('presence').textContent=event.names.join(', ')||'—';
     else if(event.type==='error'){
       if(event.code==='DB_UNAVAILABLE'&&event.retryable){
-        databaseBlocked=true;sendQueue.reset();readRequested=new Map();render();
+        databaseBlocked=true;if(event.operation==='send')sendQueue.failed(pending,event.requestId);else sendQueue.reset();store();readRequested=new Map();render();
         $('notice').textContent='DB 처리 실패 · ACK 없음 · 전송 대기 유지 · '+event.requestId;
         // Keep the joined socket open; retry this exact request only after DB recovery.
         if(event.operation==='join'){ws.close();}
@@ -95,7 +109,7 @@ function connect(){
 function disconnect(){sendTyping(false);sendQueue.reset();peerTyping.clear();renderTyping();wanted=false;joined=false;generation++;clearTimeout(retry);socket?.close();socket=null;status('연결 종료');$('presence').textContent='—'}
 $('connect').onclick=()=>{name=$('name').value.trim();if(!name||name.length>20){$('notice').textContent='이름은 1~20자입니다.';return}wanted=true;connect()};$('disconnect').onclick=disconnect;
 $('room').onchange=()=>{const again=wanted;disconnect();room=$('room').value;messages=new Map();reads=new Map();readRequested=new Map();$('room-name').textContent=$('room').selectedOptions[0].textContent;$('notice').textContent='';render();if(again){wanted=true;connect()}};
-$('compose').onsubmit=e=>{e.preventDefault();const body=$('body').value.trim();if(!joined||!body)return;sendTyping(false);const requestId=crypto.randomUUID();pending.push({roomId:room,requestId,body,mode:$('mode').value});if($('fault').checked){cutRequest=requestId;$('fault').checked=false}store();$('body').value='';render();flush()};
+$('compose').onsubmit=e=>{e.preventDefault();const body=$('body').value.trim();if(!joined||!body)return;sendTyping(false);const requestId=crypto.randomUUID();pending.push({roomId:room,requestId,body,mode:$('mode').value,cancelable:true});if($('fault').checked){cutRequest=requestId;$('fault').checked=false}if(!store()){pending.pop();return}$('body').value='';render();flush()};
 $('body').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();$('compose').requestSubmit()}};
 window.addEventListener('pagehide',()=>{clearTimeout(retry);socket?.close()});status('연결 전');render();
 

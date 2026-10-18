@@ -9,3 +9,5 @@
 .fault-control{display:flex;gap:8px;align-items:center;font-size:13px;color:#ffc391;margin-top:12px}.fault-control input{width:16px;height:16px;accent-color:#ff984f}.outbox{font-size:12px;overflow-wrap:anywhere;color:#ffc391;margin:8px 0}.outbox:empty{display:none}
 
 .outbox ol{list-style:none;margin:8px 0;padding:0;max-height:240px;overflow:auto}.outbox li{padding:10px;border:1px solid #ffb47a33;border-radius:5px;margin-top:6px;background:#30251e}.outbox li[data-queue-state=sending]{border-color:#ffb47a}.outbox li p{margin:5px 0;font-size:13px;color:#e4d3c6}.outbox code{font-size:11px;display:block;overflow-wrap:anywhere}
+
+.cancel-action{display:block;margin-top:8px;color:#e9a89f;font-size:12px}.cancelled{color:#d9b3af}.cancelled li{background:#2b252a;border-color:#d9b3af33}.cancelled li p{text-decoration:line-through;color:#bba9a9}
